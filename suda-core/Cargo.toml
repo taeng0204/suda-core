@@ -1,0 +1,40 @@
+[package]
+name = "suda-core"
+version = "0.1.0"
+edition = "2021"
+description = "DynFrs-based Exact Unlearning Random Forest for NIDS"
+license = "MIT"
+
+[lib]
+name = "suda_core"
+# cdylib for Python module, rlib for Rust tests
+# Use maturin for building the Python module
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enable this feature when building with maturin
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+# Python bindings
+pyo3 = "0.23"
+numpy = "0.23"
+
+# Parallelization
+rayon = "1.10"
+
+# Fast HashMap
+hashbrown = "0.15"
+
+# Random number generation
+rand = "0.8"
+rand_xorshift = "0.3"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "suda"
+version = "0.1.0"
+description = "Selective Unlearning for Drift Adaptation in NIDS"
+requires-python = ">=3.12"
+dependencies = [
+    "easydict>=1.13",
+    "gdown>=5.2.0",
+    "imbalanced-learn>=0.14.1",
+    "ipython>=9.8.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.8",
+    "maturin>=1.10.2",
+    "numpy>=2.4.0",
+    "pandas>=2.3.3",
+    "pyarrow>=23.0.0",
+    "pytest>=9.0.2",
+    "river>=0.23.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.16.3",
+    "seaborn>=0.13.2",
+    "torch>=2.9.1",
+    "torchmetrics>=1.8.2",
+    "torchvision>=0.24.1",
+    "python-docx>=1.1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
