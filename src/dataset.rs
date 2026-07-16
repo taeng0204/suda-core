@@ -104,11 +104,6 @@ impl ArrayDataset {
             types,
         }
     }
-
-    /// Set the type for an attribute.
-    pub fn set_attribute_type(&mut self, index: u8, attr_type: AttributeType) {
-        self.types[index as usize] = attr_type;
-    }
 }
 
 impl Dataset for ArrayDataset {

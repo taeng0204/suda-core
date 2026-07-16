@@ -426,9 +426,9 @@ mod tests {
 
         // Add some predictions
         cm.update(false, false); // TN
-        cm.update(false, true);  // FP
-        cm.update(true, false);  // FN
-        cm.update(true, true);   // TP
+        cm.update(false, true); // FP
+        cm.update(true, false); // FN
+        cm.update(true, true); // TP
 
         assert_eq!(cm.tn, 1);
         assert_eq!(cm.fp, 1);
@@ -512,20 +512,20 @@ mod tests {
         let mut cm = ConfusionMatrix::new();
 
         // 99% benign, 1% attack - trivial "always benign" classifier
-        cm.tn = 9900;  // All benign correctly classified
+        cm.tn = 9900; // All benign correctly classified
         cm.fp = 0;
-        cm.fn_ = 100;  // All attacks missed
+        cm.fn_ = 100; // All attacks missed
         cm.tp = 0;
 
         assert!((cm.accuracy() - 0.99).abs() < 1e-10); // 99% accuracy!
-        assert_eq!(cm.tpr(), 0.0);  // 0% attack recall
+        assert_eq!(cm.tpr(), 0.0); // 0% attack recall
         assert_eq!(cm.gmean(), 0.0); // 0% G-mean (correctly captures failure)
 
         // Good classifier on same data
-        cm.tn = 9850;  // 50 false positives
+        cm.tn = 9850; // 50 false positives
         cm.fp = 50;
-        cm.fn_ = 20;   // 20 missed attacks
-        cm.tp = 80;    // 80% attack recall
+        cm.fn_ = 20; // 20 missed attacks
+        cm.tp = 80; // 80% attack recall
 
         assert!(cm.accuracy() > 0.99); // Still high accuracy
         assert!((cm.tpr() - 0.80).abs() < 1e-10); // 80% attack recall

@@ -48,10 +48,12 @@ impl Split {
     }
 
     /// Check if a value goes left for this split.
+    /// Bug-2 (DynFrs 정합): `<=` 사용. DynFrs.h:286, 494, 563 모두 `<=`로 일관.
+    /// 이전 `<`는 streaming.rs:210,247의 `<=` 통계와 경계값 sample에서 미세 불일치 야기.
     #[inline]
     pub fn goes_left(&self, value: f32) -> bool {
         match self {
-            Split::Numerical { threshold, .. } => value < *threshold,
+            Split::Numerical { threshold, .. } => value <= *threshold,
             Split::Categorical { subset, .. } => {
                 let category = value as u64;
                 (*subset & (1u64 << category)) != 0
@@ -85,10 +87,29 @@ mod tests {
 
     #[test]
     fn test_numerical_split() {
+        // Bug-2 (DynFrs 정합): goes_left은 value <= threshold이면 true.
         let split = Split::numerical(0, 5.0);
         assert!(split.goes_left(4.0));
-        assert!(!split.goes_left(5.0));
+        assert!(split.goes_left(5.0)); // 경계값: <=이므로 left
         assert!(!split.goes_left(6.0));
+    }
+
+    /// Bug-2 명시 검증: 경계값 sample이 streaming 통계(`<=`)와 routing(`<=`)에서 일관.
+    /// 이전(`<`)에는 경계값 sample이 통계는 left에 집계되지만 routing은 right로 가서
+    /// best_split_changed 평가와 실제 partition이 불일치. 미세 silent 버그.
+    /// 이 test는 *DynFrs 정합 후의 동작*을 명시적으로 박아 미래 회귀 방지.
+    #[test]
+    fn test_boundary_value_routes_left_matching_stats() {
+        let split = Split::numerical(0, 5.0);
+        // 정확히 threshold 값 → left로 routing (streaming.rs:210,247 통계와 일관)
+        assert!(
+            split.goes_left(5.0),
+            "value == threshold은 left (DynFrs.h:286,494,563 `<=`와 정합)"
+        );
+        // threshold 미만 → left
+        assert!(split.goes_left(4.99));
+        // threshold 초과 → right
+        assert!(!split.goes_left(5.01));
     }
 
     #[test]

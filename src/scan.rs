@@ -22,12 +22,10 @@ pub fn scan<S: Sample>(samples: &[S], split: &Split) -> SplitStats {
             } else {
                 num_minus_left += 1;
             }
+        } else if is_plus {
+            num_plus_right += 1;
         } else {
-            if is_plus {
-                num_plus_right += 1;
-            } else {
-                num_minus_right += 1;
-            }
+            num_minus_right += 1;
         }
     }
 
@@ -130,12 +128,10 @@ pub fn scan_refs<S: Sample>(samples: &[&S], split: &Split) -> SplitStats {
             } else {
                 num_minus_left += 1;
             }
+        } else if is_plus {
+            num_plus_right += 1;
         } else {
-            if is_plus {
-                num_plus_right += 1;
-            } else {
-                num_minus_right += 1;
-            }
+            num_minus_right += 1;
         }
     }
 

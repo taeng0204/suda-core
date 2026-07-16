@@ -44,9 +44,9 @@ pub fn calc_score(ls_s: u32, ls_1: u32, rs_s: u32, rs_1: u32) -> f64 {
 pub struct ThresholdCandidate {
     /// The threshold value
     pub threshold: f32,
-    /// Count of samples <= threshold (left side)
+    /// Count of samples < threshold (left side, consistent with Split::goes_left)
     pub left_count: u32,
-    /// Count of positive samples <= threshold
+    /// Count of positive samples < threshold
     pub left_positive: u32,
 }
 
@@ -187,7 +187,13 @@ impl AttributeCandidate {
 
     /// Update statistics when a sample is added.
     /// Returns true if the candidate was invalidated (range expanded).
-    pub fn add_sample(&mut self, value: f32, label: bool, total_samples: u32, total_positive: u32) -> bool {
+    pub fn add_sample(
+        &mut self,
+        value: f32,
+        label: bool,
+        total_samples: u32,
+        total_positive: u32,
+    ) -> bool {
         // Check if range is expanded
         if value < self.min_val {
             self.min_val = value;
@@ -204,6 +210,7 @@ impl AttributeCandidate {
         }
 
         // Update threshold counts
+        // NOTE: Use strict `<` to match Split::goes_left() in split.rs
         self.best_score = f64::MAX;
         for candidate in &mut self.thresholds {
             if value <= candidate.threshold {
@@ -225,7 +232,13 @@ impl AttributeCandidate {
 
     /// Update statistics when a sample is removed.
     /// Returns true if the candidate was invalidated (range shrunk to empty).
-    pub fn remove_sample(&mut self, value: f32, label: bool, total_samples: u32, total_positive: u32) -> bool {
+    pub fn remove_sample(
+        &mut self,
+        value: f32,
+        label: bool,
+        total_samples: u32,
+        total_positive: u32,
+    ) -> bool {
         // Check if removing min/max
         if (value - self.min_val).abs() < f32::EPSILON {
             self.min_count -= 1;
@@ -240,6 +253,7 @@ impl AttributeCandidate {
         }
 
         // Update threshold counts
+        // NOTE: Use strict `<` to match Split::goes_left() in split.rs
         self.best_score = f64::MAX;
         for candidate in &mut self.thresholds {
             if value <= candidate.threshold {
@@ -291,13 +305,15 @@ impl AttributeStats {
         }
     }
 
+    //   DynFrs random mode: tree-shared mt19937 (SUDA에서는 init 시점 seed로 충분).
+
     /// Initialize from a batch of samples.
     pub fn init_from_batch<F>(
         &mut self,
-        samples: &[u64],           // sample IDs
-        get_features: F,           // closure to get features: id -> &[f32]
+        samples: &[u64], // sample IDs
+        get_features: F, // closure to get features: id -> &[f32]
         get_label: impl Fn(u64) -> bool,
-        num_candidates: usize,     // number of attribute candidates to try
+        num_candidates: usize, // number of attribute candidates to try
     ) where
         F: Fn(u64) -> Vec<f32>,
     {
@@ -324,12 +340,9 @@ impl AttributeStats {
                 .collect();
 
             // Try to create candidate
-            if let Some(candidate) = AttributeCandidate::init_from_batch(
-                attr_idx,
-                &values,
-                P_TRIES,
-                &mut self.rng,
-            ) {
+            if let Some(candidate) =
+                AttributeCandidate::init_from_batch(attr_idx, &values, P_TRIES, &mut self.rng)
+            {
                 self.candidates.insert(attr_idx, candidate);
             } else {
                 self.constant_attrs[attr_idx as usize] = true;
@@ -386,41 +399,6 @@ impl AttributeStats {
         invalidated.len()
     }
 
-    /// Find the two best split scores across all candidates.
-    ///
-    /// Returns (best_score, second_best_score, best_attr_idx, best_threshold).
-    pub fn top_two_splits(&self) -> (f64, f64, Option<u8>, f32) {
-        let mut best_score = f64::MAX;
-        let mut second_score = f64::MAX;
-        let mut best_attr: Option<u8> = None;
-        let mut best_threshold: f32 = 0.0;
-
-        for candidate in self.candidates.values() {
-            if candidate.best_score < best_score {
-                second_score = best_score;
-                best_score = candidate.best_score;
-                best_attr = Some(candidate.attr_idx);
-                best_threshold = candidate.best_threshold;
-            } else if candidate.best_score < second_score {
-                second_score = candidate.best_score;
-            }
-        }
-
-        (best_score, second_score, best_attr, best_threshold)
-    }
-
-    /// Calculate the Hoeffding bound epsilon for n observed samples.
-    ///
-    /// Guarantees that the true mean is within epsilon of the sample mean
-    /// with probability 1-delta. For Gini impurity, R = 0.5 (range [0, 0.5]).
-    pub fn hoeffding_bound(n: usize, delta: f64) -> f64 {
-        if n == 0 {
-            return f64::MAX;
-        }
-        let r = 0.5_f64;
-        (r * r * (1.0 / delta).ln() / (2.0 * n as f64)).sqrt()
-    }
-
     /// Find the best split among all candidates.
     /// Returns (attribute_index, threshold, score) or None if no valid split.
     pub fn find_best_split(&self) -> Option<(u8, f32, f64)> {
@@ -430,10 +408,18 @@ impl AttributeStats {
             if candidate.best_score < f64::MAX {
                 match best {
                     None => {
-                        best = Some((candidate.attr_idx, candidate.best_threshold, candidate.best_score));
+                        best = Some((
+                            candidate.attr_idx,
+                            candidate.best_threshold,
+                            candidate.best_score,
+                        ));
                     }
                     Some((_, _, best_score)) if candidate.best_score < best_score => {
-                        best = Some((candidate.attr_idx, candidate.best_threshold, candidate.best_score));
+                        best = Some((
+                            candidate.attr_idx,
+                            candidate.best_threshold,
+                            candidate.best_score,
+                        ));
                     }
                     _ => {}
                 }
@@ -444,7 +430,12 @@ impl AttributeStats {
     }
 
     /// Check if this node should be a leaf.
-    pub fn should_be_leaf(&self, min_samples_split: u32, max_depth: u32, current_depth: u32) -> bool {
+    pub fn should_be_leaf(
+        &self,
+        min_samples_split: u32,
+        max_depth: u32,
+        current_depth: u32,
+    ) -> bool {
         self.total_samples < min_samples_split
             || self.total_positive == 0
             || self.total_positive == self.total_samples
@@ -466,20 +457,15 @@ impl AttributeStats {
 }
 
 /// Delay tag for lazy rebuild (corresponds to C++ `delay` field).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DelayTag {
     /// No pending operation (delay=0)
+    #[default]
     None,
     /// Needs build (delay=1) - node has samples but no split computed
     NeedsBuild,
     /// Needs separate + build (delay=2) - split changed, need to re-partition
     NeedsSeparateAndBuild,
-}
-
-impl Default for DelayTag {
-    fn default() -> Self {
-        DelayTag::None
-    }
 }
 
 /// Streaming node state for incremental learning.
@@ -572,12 +558,7 @@ mod tests {
 
     #[test]
     fn test_attribute_candidate_add_sample() {
-        let values: Vec<(f32, bool)> = vec![
-            (2.0, true),
-            (4.0, true),
-            (6.0, false),
-            (8.0, false),
-        ];
+        let values: Vec<(f32, bool)> = vec![(2.0, true), (4.0, true), (6.0, false), (8.0, false)];
 
         let mut rng = XorShiftRng::seed_from_u64(42);
         let mut candidate = AttributeCandidate::init_from_batch(0, &values, 3, &mut rng).unwrap();

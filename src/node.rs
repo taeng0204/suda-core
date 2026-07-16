@@ -16,20 +16,15 @@ use hashbrown::HashSet;
 /// The `develop()` traversal processes tags bottom-up: Dirty nodes check if their
 /// split is still valid (otherwise promote to Rebuild), and Rebuild nodes are
 /// reconstructed from scratch using only the remaining samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LazyTag {
     /// No rebuild needed — node is up-to-date
+    #[default]
     Clean,
     /// Sample(s) deleted — split may be suboptimal, pending develop()
     Dirty,
     /// Subtree needs complete rebuild from remaining samples
     Rebuild,
-}
-
-impl Default for LazyTag {
-    fn default() -> Self {
-        LazyTag::Clean
-    }
 }
 
 /// A node in the decision tree.
@@ -45,9 +40,7 @@ pub enum Node {
         num_samples: u32,
         /// Number of positive samples passing through
         num_plus: u32,
-        /// Stream position when this split was created (for age-based subtree refresh)
-        created_at: u64,
-        /// Weighted Gini impurity at split creation time (for quality monitoring)
+        /// Weighted Gini impurity at split creation time (현재 미사용, dead but kept for layout).
         split_gini: f64,
     },
     /// Leaf node with prediction
@@ -69,43 +62,17 @@ impl Node {
             lazy_tag: LazyTag::Clean,
             num_samples,
             num_plus,
-            created_at: 0,
             split_gini: 0.0,
         }
     }
 
-    /// Create a new internal node with a creation timestamp.
-    pub fn internal_with_age(split: Split, num_samples: u32, num_plus: u32, created_at: u64) -> Self {
+    /// Create a new internal node (split_gini는 현재 미사용이지만 호출처 호환성 위해 인자 유지).
+    pub fn internal_full(split: Split, num_samples: u32, num_plus: u32, split_gini: f64) -> Self {
         Node::Internal {
             split,
             lazy_tag: LazyTag::Clean,
             num_samples,
             num_plus,
-            created_at,
-            split_gini: 0.0,
-        }
-    }
-
-    /// Create a new internal node with split quality recorded.
-    pub fn internal_with_gini(split: Split, num_samples: u32, num_plus: u32, split_gini: f64) -> Self {
-        Node::Internal {
-            split,
-            lazy_tag: LazyTag::Clean,
-            num_samples,
-            num_plus,
-            created_at: 0,
-            split_gini,
-        }
-    }
-
-    /// Create a new internal node with both creation timestamp and split quality.
-    pub fn internal_full(split: Split, num_samples: u32, num_plus: u32, created_at: u64, split_gini: f64) -> Self {
-        Node::Internal {
-            split,
-            lazy_tag: LazyTag::Clean,
-            num_samples,
-            num_plus,
-            created_at,
             split_gini,
         }
     }
@@ -125,15 +92,6 @@ impl Node {
             num_samples,
             num_plus,
             sample_ids,
-        }
-    }
-
-    /// Create an empty leaf (zero samples). Used by Hoeffding inline splits.
-    pub fn leaf_empty() -> Self {
-        Node::Leaf {
-            num_samples: 0,
-            num_plus: 0,
-            sample_ids: HashSet::new(),
         }
     }
 
@@ -185,14 +143,6 @@ impl Node {
     pub fn lazy_tag(&self) -> Option<LazyTag> {
         match self {
             Node::Internal { lazy_tag, .. } => Some(*lazy_tag),
-            Node::Leaf { .. } => None,
-        }
-    }
-
-    /// Get the creation timestamp if this is an internal node.
-    pub fn created_at(&self) -> Option<u64> {
-        match self {
-            Node::Internal { created_at, .. } => Some(*created_at),
             Node::Leaf { .. } => None,
         }
     }
@@ -312,7 +262,7 @@ pub mod node_id {
     /// Check if this is the left child.
     #[inline]
     pub fn is_left_child(id: u64) -> bool {
-        id % 2 == 0
+        id.is_multiple_of(2)
     }
 
     /// Check if this is the right child.

@@ -1,135 +1,91 @@
-# SUDA: Selective Unlearning for Drift Adaptation
+# suda-core
 
-> **Sample-level exact forgetting** for concept drift adaptation in Network Intrusion Detection Systems (NIDS).
+**A memory-safe Rust implementation of exact-unlearning Random Forests, with certified retrain-equivalence.**
 
-SUDA is a streaming random forest framework that adapts to concept drift by **precisely forgetting outdated samples** rather than replacing entire trees. Built with a high-performance Rust core (PyO3) and Python experiment interface.
+`suda-core` is the core engine underneath the **SUDA** (Selective Unlearning for Drift Adaptation) research project. It provides the data structures and algorithms for *exact* machine unlearning in Random Forests — removing individual training samples so that the resulting model is **provably identical to one retrained from scratch without those samples**, in `O(k · depth)` instead of a full retrain.
 
-## Key Idea
+This crate is the reusable foundation on top of which the SUDA experiments (streaming adaptation, influence-based eviction, budget management) are built.
 
-Existing adaptive random forests (ARF) handle concept drift by **replacing entire trees** when drift is detected — a coarse-grained approach that discards useful knowledge along with outdated patterns.
+---
 
-SUDA takes a different approach: **What if we selectively forget individual samples instead?**
+## Attribution
 
-- **Exact Forgetting**: Remove specific samples from the forest in O(k·depth), preserving the rest
-- **Budget-based Eviction**: Maintain a fixed-size sample registry; evict oldest samples via FIFO
-- **Adaptive-k Redundancy**: Protect minority classes (down to 1% attack ratio) with up to 70x redundancy
-- **Age-based Subtree Refresh**: Periodically rebuild stale splits to address "Structural Debt"
+This is an independent Rust reimplementation and extension of the **DynFrs** algorithm:
 
-## Key Findings (~3,400 experiments)
+> Shurong Wang, Zhuoyang Shen, Xinbao Qiao, Tongning Zhang, Meng Zhang.
+> **DynFrs: An Efficient Framework for Machine Unlearning in Random Forest.**
+> *ICLR 2025.* <https://openreview.net/forum?id=nsCOeCLR8e>
 
-| Finding | Detail |
-|---------|--------|
-| **HOW > WHAT** | The forgetting *mechanism* matters more than the *selection strategy* — registry removal without `forest.forget()` has **zero effect** (36/36 scenarios) |
-| **+8.6~31.4% G-mean** | Over baseline ARF on synthetic drift scenarios (p<0.001, Cohen's d=1.78) |
-| **Structural Debt** | `forget()` alone cannot update split thresholds → performance ceiling under gradual drift. Solved by `split_max_age` (+5.2%p) |
-| **~10x speedup** | Rust core vs. pure Python baseline |
+```bibtex
+@inproceedings{wang2025dynfrs,
+  title     = {DynFrs: An Efficient Framework for Machine Unlearning in Random Forest},
+  author    = {Shurong Wang and Zhuoyang Shen and Xinbao Qiao and Tongning Zhang and Meng Zhang},
+  booktitle = {The Thirteenth International Conference on Learning Representations},
+  year      = {2025},
+  url        = {https://openreview.net/forum?id=nsCOeCLR8e}
+}
+```
+
+`suda-core` does **not** claim to improve on the DynFrs *method*. Its contribution is an **implementation**: memory safety, an extensive test suite that certifies the retrain-equivalence guarantee in code, and additional streaming / eviction features (below).
+
+---
+
+## What it provides
+
+| Capability | Description |
+|------------|-------------|
+| **Exact unlearning** | `forget` / `forget_batch` remove samples with retrain-equivalent results (DynFrs guarantee), verified by tests — see [Correctness](#correctness). |
+| **OCC(q) sampling** | Each training sample is assigned to at most `k` trees, bounding per-sample unlearning cost to `O(k · depth)`. |
+| **LZY (lazy) tag rebuild** | Deletions mark subtrees `Dirty`/`Rebuild` and are reconciled in a bottom-up `develop()` pass, amortizing batch deletions. |
+| **Streaming / incremental add** | Online sample insertion with Hoeffding-bound split decisions for concept-drift settings. |
+| **Influence-based eviction** | An `InfluenceRegistry` tracks per-sample influence and supports budget-based continuous eviction to bound memory. |
+| **Class-aware `k`** | Optional fixed two-value minority redundancy (`minority_k`, disabled by default). |
+| **Python bindings** | Optional PyO3 module (`suda_core`) exposing the streaming controller to Python. |
+
+## Correctness
+
+The retrain-equivalence guarantee is checked in code, not just asserted: `tests/critical_correctness.rs` verifies that the model after `forget` is distribution-equivalent to one retrained from scratch on the remaining samples (DynFrs Theorem 1), alongside lazy-rebuild routing and streaming-state consistency. Run the suite with `cargo test`.
 
 ## Architecture
 
 ```
-Python API                          Rust Core (suda-core)
-──────────                          ─────────────────────
-SUDA.fit(X, y)          →          StreamingController::fit()
-                                     ├─ DynFrsForest::fit_weighted()  (batch)
-                                     ├─ enable_streaming()            (activate split updates)
-                                     └─ Registry::register()          (track samples)
-
-SUDA.partial_fit(X, y)  →          StreamingController::stream_batch()
-                                     ├─ predict → update_metrics      (test-then-train)
-                                     ├─ add_samples_streaming()       (insert + update splits)
-                                     ├─ enforce_budget()              (evict if |R| > B)
-                                     │   └─ forget_batch()            (exact unlearning)
-                                     └─ develop_streaming()           (rebuild LazyTag nodes)
+src/
+├── forest.rs        DynFrsForest — OCC(q) ensemble, parallel fit (rayon), exact forget
+├── tree.rs          DynFrsTree — split search, lazy-tag rebuild, streaming inserts
+├── node.rs          Node (Internal/Leaf) + LazyTag state machine (Clean→Dirty→Rebuild)
+├── registry.rs      InfluenceRegistry — influence tracking + budget eviction
+├── controller.rs    StreamingController — end-to-end streaming loop + PyO3 surface
+├── streaming.rs     Hoeffding-bound streaming split statistics
+├── split*.rs        Split representation and candidate statistics
+├── scan.rs          Cache-friendly / branchless partitioning
+├── dataset.rs       Dataset abstraction, sample.rs — Sample traits
+└── metrics/         Streaming confusion-matrix / metrics tracking
 ```
 
-## Quick Start
-
-```python
-from src.models.suda import SUDA
-
-model = SUDA(
-    num_features=41,
-    num_trees=50,
-    k=10,
-    max_depth=15,
-    budget_enabled=True,
-    budget_max_samples=3000,
-    adaptive_k_enabled=True,
-    k_min=1, k_max=70,
-)
-
-model.fit(X_warmup, y_warmup)
-
-for X_batch, y_batch in data_stream:
-    result = model.partial_fit(X_batch, y_batch)
-    print(f"G-mean: {result.metrics['gmean']:.4f}")
-```
-
-## Build
+## Build & test
 
 ```bash
-# Rust core
-cd suda-core && cargo test
-
-# Python package (requires maturin)
-uv run maturin develop --release -m suda-core/Cargo.toml
-
-# Download datasets
-uv run python datasets/download.py --all
-
-# Run experiments
-uv run python -m src.experiments.r1_grid_search --datasets nslkdd --seeds 42
+cargo build --release       # optimized (LTO) library
+cargo test                  # 99 tests
+cargo clippy --all-targets  # lint (0 warnings)
 ```
 
-## Datasets
+### Python bindings (optional)
 
-All datasets are publicly available and downloaded via `datasets/download.py`.
+Built with [maturin](https://github.com/PyO3/maturin):
 
-| Dataset | Samples | Features | Attack % | Source |
-|---------|---------|----------|----------|--------|
-| NSL-KDD | 148,517 | 41 | 48.1% | [UNB](https://www.unb.ca/cic/datasets/nsl.html) |
-| UNSW-NB15 | 257,673 | 42 | 63.9% | [UNSW](https://research.unsw.edu.au/projects/unsw-nb15-dataset) |
-| CIC-IDS2018 | 43,036 | 78 | 96.7% | [UNB](https://www.unb.ca/cic/datasets/ids-2018.html) |
-| ANoShift | ~50,000 | 15 | 60.3% | [ANoShift](https://github.com/bit-ml/ANoShift) |
-
-## Project Structure
-
-```
-suda-public/
-├── suda-core/           # Rust core (PyO3 bindings)
-│   ├── src/
-│   │   ├── controller.rs    # StreamingController — main pipeline
-│   │   ├── forest.rs        # DynFrsForest — OCC(k) + exact unlearning
-│   │   ├── tree.rs          # DynFrsTree — batch + streaming learning
-│   │   ├── registry.rs      # InfluenceRegistry — sample tracking + eviction
-│   │   ├── node.rs          # Node — Internal/Leaf, LazyTag
-│   │   ├── streaming.rs     # Streaming split updates
-│   │   └── metrics/         # G-mean, accuracy tracking
-│   ├── tests/
-│   └── Cargo.toml
-├── src/                 # Python interface
-│   ├── models/suda.py       # SUDA Python wrapper
-│   ├── data/nids.py         # Dataset loaders
-│   ├── baselines/           # ARF, SRP baselines
-│   └── experiments/         # Experiment scripts
-├── tests/               # Python tests
-├── datasets/            # Download scripts (data not included)
-└── pyproject.toml
+```bash
+maturin develop --release --features extension-module
 ```
 
-## Citation
-
-Paper in preparation. If you use this code, please cite:
-
-```bibtex
-@misc{lim2026suda,
-  title={SUDA: Selective Unlearning for Drift Adaptation in Network Intrusion Detection},
-  author={Taein Lim},
-  year={2026},
-  note={In preparation}
-}
+```python
+from suda_core import PyStreamingController
 ```
+
+## Scope
+
+This crate deliberately contains **only** the unlearning-tree engine and its correctness/performance concerns. Downstream benchmarking, datasets, and the SUDA research findings live in a separate project and are **not** part of this repository — so nothing here depends on any particular empirical result.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

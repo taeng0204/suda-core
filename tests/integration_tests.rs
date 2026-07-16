@@ -3,9 +3,16 @@
 //! These tests verify the complete workflow of the DynFrs Random Forest,
 //! including OCC(q) sampling, exact unlearning, and lazy rebuild.
 
+use hashbrown::HashMap;
+
 use suda_core::forest::{DynFrsForest, ForestConfig};
 use suda_core::sample::VecSample;
 use suda_core::tree::TreeConfig;
+
+/// Build a feature map (sample_id → values) for batch forget API.
+fn make_feature_map(samples: &[VecSample]) -> HashMap<u64, Vec<f32>> {
+    samples.iter().map(|s| (s.id, s.values.clone())).collect()
+}
 
 /// Generate synthetic samples for testing.
 fn make_test_samples(count: usize, num_features: u8, seed: u64) -> Vec<VecSample> {
@@ -16,7 +23,9 @@ fn make_test_samples(count: usize, num_features: u8, seed: u64) -> Vec<VecSample
     let mut samples = Vec::with_capacity(count);
 
     for i in 0..count {
-        let values: Vec<f32> = (0..num_features).map(|_| rng.gen_range(-5.0..5.0)).collect();
+        let values: Vec<f32> = (0..num_features)
+            .map(|_| rng.gen_range(-5.0..5.0))
+            .collect();
         // Simple rule: positive if first feature > 0
         let label = values[0] > 0.0;
         samples.push(VecSample::new(i as u64, values, label));
@@ -36,14 +45,13 @@ fn test_forest_end_to_end() {
     let config = ForestConfig {
         num_trees: 20,
         k: 5,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 8,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 5,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 42,
     };
@@ -77,7 +85,8 @@ fn test_forest_end_to_end() {
 
     // Test forget
     let samples_to_forget = vec![0, 1, 2, 3, 4];
-    let forgotten = forest.forget_batch(&samples_to_forget);
+    let fmap = make_feature_map(&samples);
+    let forgotten = forest.forget_batch(&samples_to_forget, &fmap);
     assert_eq!(forgotten, 5);
     assert_eq!(forest.num_samples(), num_samples - 5);
 
@@ -104,14 +113,13 @@ fn test_occ_sampling_invariant() {
     let config = ForestConfig {
         num_trees: 30,
         k: 5,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 6,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 3,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 123,
     };
@@ -126,11 +134,7 @@ fn test_occ_sampling_invariant() {
 
     // After fitting, all samples should be tracked
     for i in 0..num_samples {
-        assert!(
-            forest.contains_sample(i as u64),
-            "Sample {} not tracked",
-            i
-        );
+        assert!(forest.contains_sample(i as u64), "Sample {} not tracked", i);
     }
 
     println!(
@@ -148,24 +152,25 @@ fn test_exact_unlearning() {
     let config = ForestConfig {
         num_trees: 10,
         k: 3,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 5,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 3,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 456,
     };
     let mut forest = DynFrsForest::new(config, num_features);
     forest.fit(&samples);
 
+    let fmap = make_feature_map(&samples);
+
     // Forget single sample
     let sample_id = 25u64;
     assert!(forest.contains_sample(sample_id));
-    let was_forgotten = forest.forget(sample_id);
+    let was_forgotten = forest.forget(sample_id, &fmap[&sample_id]);
     assert!(was_forgotten, "Sample should have been forgotten");
     assert!(
         !forest.contains_sample(sample_id),
@@ -174,7 +179,7 @@ fn test_exact_unlearning() {
 
     // Forget multiple samples
     let batch: Vec<u64> = (30..35).collect();
-    let forgotten_count = forest.forget_batch(&batch);
+    let forgotten_count = forest.forget_batch(&batch, &fmap);
     assert_eq!(forgotten_count, 5, "Should have forgotten 5 samples");
 
     for id in batch {
@@ -182,7 +187,7 @@ fn test_exact_unlearning() {
     }
 
     // Trying to forget already-forgotten sample
-    let was_forgotten_again = forest.forget(sample_id);
+    let was_forgotten_again = forest.forget(sample_id, &fmap[&sample_id]);
     assert!(
         !was_forgotten_again,
         "Cannot forget already-forgotten sample"
@@ -200,14 +205,13 @@ fn test_predictions_after_forget() {
     let config = ForestConfig {
         num_trees: 15,
         k: 4,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 7,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 5,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 789,
     };
@@ -223,7 +227,8 @@ fn test_predictions_after_forget() {
 
     // Forget 20% of samples
     let to_forget: Vec<u64> = (0..20).collect();
-    forest.forget_batch(&to_forget);
+    let fmap = make_feature_map(&samples);
+    forest.forget_batch(&to_forget, &fmap);
 
     // Predictions should still work on remaining samples
     let remaining_samples: Vec<_> = samples[20..].to_vec();
@@ -267,14 +272,13 @@ fn test_imbalanced_data() {
     let config = ForestConfig {
         num_trees: 20,
         k: 5,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 8,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 5,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 999,
     };
@@ -311,14 +315,13 @@ fn test_tree_stats() {
     let config = ForestConfig {
         num_trees: 10,
         k: 3,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 5,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 3,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 111,
     };
@@ -338,91 +341,62 @@ fn test_tree_stats() {
     );
 }
 
-/// Test optimized batch forget with 33% threshold (DynFrs algorithm)
+/// forget_batch는 lazy resolve 경로만 사용한다.
 #[test]
-fn test_batch_forget_optimized() {
+fn test_batch_forget_lazy_resolve() {
     let num_features: u8 = 10;
     let num_samples = 200;
     let samples = make_test_samples(num_samples, num_features, 42);
 
-    // Create and fit forest
     let config = ForestConfig {
         num_trees: 20,
         k: 5,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 8,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 5,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 42,
     };
     let mut forest = DynFrsForest::new(config, num_features);
     forest.fit(&samples);
+    forest.enable_streaming(&samples);
 
-    assert_eq!(forest.num_samples(), num_samples);
+    let batch: Vec<u64> = (0..50).collect();
+    let mut fmap: hashbrown::HashMap<u64, Vec<f32>> = hashbrown::HashMap::new();
+    for s in &samples {
+        if batch.contains(&s.id) {
+            fmap.insert(s.id, s.values.clone());
+        }
+    }
+    let forgotten = forest.forget_batch(&batch, &fmap);
+    assert_eq!(forgotten, 50);
+    assert_eq!(forest.num_samples(), num_samples - 50);
 
-    // Test case 1: Small deletion (< 33%) - should use incremental path
-    let small_batch: Vec<u64> = (0..20).collect();  // 10% deletion
-    let remaining_samples: Vec<_> = samples.iter()
-        .filter(|s| !small_batch.contains(&s.id))
+    // lazy resolve로 후속 처리 검증
+    let remaining_samples: Vec<_> = samples
+        .iter()
+        .filter(|s| !batch.contains(&s.id))
         .cloned()
         .collect();
+    let sample_map: hashbrown::HashMap<u64, &VecSample> =
+        remaining_samples.iter().map(|s| (s.id, s)).collect();
+    let _preds = forest.predict_batch_with_lazy_resolve(&remaining_samples[..10], &sample_map);
 
-    let forgotten = forest.forget_batch_optimized(&small_batch, &remaining_samples);
-    assert_eq!(forgotten, 20);
-    assert_eq!(forest.num_samples(), num_samples - 20);
-
-    // Verify predictions still work
-    let predictions = forest.predict_batch(&remaining_samples[..10].to_vec());
-    assert_eq!(predictions.len(), 10);
-
-    // Test case 2: Large deletion (> 33%) - should trigger rebuild path
-    let mut forest2 = DynFrsForest::new(ForestConfig {
-        num_trees: 20,
-        k: 5,
-        tree_config: TreeConfig {
-            max_depth: 8,
-            min_samples_split: 2,
-            min_samples_leaf: 1,
-            max_features: None,
-            num_splits_to_try: 5,
-            split_quality_threshold: None,
-            ..Default::default()
-        },
-        seed: 42,
-    }, num_features);
-    forest2.fit(&samples);
-
-    let large_batch: Vec<u64> = (0..100).collect();  // 50% deletion (> 33% threshold)
-    let remaining_samples2: Vec<_> = samples.iter()
-        .filter(|s| !large_batch.contains(&s.id))
-        .cloned()
-        .collect();
-
-    let forgotten2 = forest2.forget_batch_optimized(&large_batch, &remaining_samples2);
-    assert_eq!(forgotten2, 100);
-    assert_eq!(forest2.num_samples(), 100);
-
-    // Verify all forgotten samples are gone
-    for id in &large_batch {
-        assert!(!forest2.contains_sample(*id), "Sample {} should be forgotten", id);
+    for id in &batch {
+        assert!(
+            !forest.contains_sample(*id),
+            "Sample {} should be forgotten",
+            id
+        );
     }
-
-    // Verify remaining samples are tracked
-    for sample in &remaining_samples2 {
-        assert!(forest2.contains_sample(sample.id), "Sample {} should exist", sample.id);
-    }
-
-    // Verify predictions work after large deletion
-    let predictions2 = forest2.predict_batch(&remaining_samples2);
-    assert_eq!(predictions2.len(), remaining_samples2.len());
-
-    println!("Optimized batch forget test passed: small_batch={}, large_batch={}",
-             forgotten, forgotten2);
+    println!(
+        "Batch forget lazy resolve test passed: forgotten={}",
+        forgotten
+    );
 }
 
 /// Test streaming controller full pipeline: fit -> stream cycle
@@ -434,6 +408,7 @@ fn test_controller_full_pipeline() {
         num_features: 5,
         num_trees: 10,
         k: 3,
+        minority_k: 0,
         max_depth: 5,
         warmup_samples: 20,
         seed: 42,
@@ -443,9 +418,7 @@ fn test_controller_full_pipeline() {
     let mut controller = StreamingController::new(config);
 
     // Phase 1: Warmup with fit
-    let features: Vec<Vec<f32>> = (0..30)
-        .map(|i| vec![(i as f32) * 0.1; 5])
-        .collect();
+    let features: Vec<Vec<f32>> = (0..30).map(|i| vec![(i as f32) * 0.1; 5]).collect();
     let labels: Vec<bool> = (0..30).map(|i| i % 3 == 0).collect();
     controller.fit(&features, &labels);
 
@@ -466,7 +439,10 @@ fn test_controller_full_pipeline() {
     }
 
     assert_eq!(total_predictions, 50);
-    assert!(controller.registry_size() > 30, "Registry should grow during streaming");
+    assert!(
+        controller.registry_size() > 30,
+        "Registry should grow during streaming"
+    );
 }
 
 /// Test streaming controller with budget management enabled
@@ -478,6 +454,7 @@ fn test_controller_with_budget() {
         num_features: 5,
         num_trees: 10,
         k: 3,
+        minority_k: 0,
         max_depth: 5,
         warmup_samples: 10,
         seed: 42,
@@ -490,9 +467,7 @@ fn test_controller_with_budget() {
     let mut controller = StreamingController::new(config);
 
     // Warmup
-    let features: Vec<Vec<f32>> = (0..20)
-        .map(|i| vec![i as f32 * 0.1; 5])
-        .collect();
+    let features: Vec<Vec<f32>> = (0..20).map(|i| vec![i as f32 * 0.1; 5]).collect();
     let labels: Vec<bool> = (0..20).map(|i| i % 2 == 0).collect();
     controller.fit(&features, &labels);
 
@@ -569,24 +544,25 @@ fn test_exact_unlearning_equivalence() {
     let base_config = ForestConfig {
         num_trees: 30,
         k: 5,
+        minority_k: 0,
         tree_config: TreeConfig {
             max_depth: 10,
             min_samples_split: 2,
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 5,
-            split_quality_threshold: None,
-            ..Default::default()
         },
         seed: 42,
     };
 
-    // Path A: fit all → forget → develop
+    // Path A: fit all → forget → lazy resolve query
     let mut forest_a = DynFrsForest::new(base_config.clone(), num_features);
     forest_a.fit(&all_samples);
-    forest_a.forget_batch(&forget_ids);
-    forest_a.develop(&remaining_samples);
-    let preds_a = forest_a.predict_batch(&test_samples);
+    let fmap_a = make_feature_map(&all_samples);
+    forest_a.forget_batch(&forget_ids, &fmap_a);
+    let map_a: hashbrown::HashMap<u64, &VecSample> =
+        remaining_samples.iter().map(|s| (s.id, s)).collect();
+    let preds_a = forest_a.predict_batch_with_lazy_resolve(&test_samples, &map_a);
 
     // Path B: fit only remaining samples (retrain without forgotten)
     let mut forest_b = DynFrsForest::new(base_config, num_features);
@@ -666,6 +642,8 @@ fn test_reversed_imbalance_soft_eviction() {
         age_weight: 0.6,
         influence_weight: 0.2,
         class_weight: 0.2,
+        random_eviction: false,
+        class_aware_random: false,
     });
 
     // Simulate CIC-IDS2018: 97% attack (true), 3% benign (false)

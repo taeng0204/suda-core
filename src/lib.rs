@@ -24,12 +24,16 @@ pub mod streaming;
 pub mod tree;
 
 // Re-exports
-pub use controller::{SUDAConfig, StreamingController, StreamingResult, FeatureProvider, SimpleFeatureStore};
+pub use controller::{
+    FeatureProvider, SUDAConfig, SimpleFeatureStore, StreamingController, StreamingResult,
+};
 pub use dataset::{ArrayDataset, AttributeType, Dataset};
 pub use forest::DynFrsForest;
 pub use metrics::{ConfusionMatrix, MetricsTracker, StreamingMetrics};
-pub use node::Node;
-pub use registry::{BudgetConfig, EvictionStats, InfluenceRegistry, SampleLifecycle, TrackedSample};
+pub use node::{LazyTag, Node};
+pub use registry::{
+    BudgetConfig, EvictionStats, InfluenceRegistry, SampleLifecycle, TrackedSample,
+};
 pub use sample::{ArraySample, Sample, VecSample};
 pub use split::Split;
 pub use split_stats::SplitStats;
@@ -41,7 +45,6 @@ use pyo3::prelude::*;
 /// Python module for SUDA Core
 #[pymodule]
 fn suda_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<forest::PyDynFrsForest>()?;
     m.add_class::<controller::PyStreamingController>()?;
     Ok(())
 }

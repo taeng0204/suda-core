@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use hashbrown::HashMap;
 
-use crate::forest::{AdaptiveKConfig, DynFrsForest, ForestConfig};
+use crate::forest::{DynFrsForest, ForestConfig};
 use crate::metrics::{MetricsTracker, StreamingMetrics};
 use crate::registry::InfluenceRegistry;
 use crate::sample::VecSample;
@@ -81,6 +81,10 @@ impl SimpleFeatureStore {
     pub fn keys(&self) -> impl Iterator<Item = &u64> {
         self.features.keys()
     }
+
+    pub fn sample_ids(&self) -> Vec<u64> {
+        self.features.keys().copied().collect()
+    }
 }
 
 impl Default for SimpleFeatureStore {
@@ -100,14 +104,18 @@ impl FeatureProvider for SimpleFeatureStore {
 /// Configuration for the streaming controller.
 ///
 /// Fields are organized into tiers:
-/// - **Core**: Forest structure, warmup, adaptive-k (always needed)
-/// - **Budget**: Budget management parameters (key mechanism)
-/// - **Experimental**: Influence tracking, feature distance, window retrain
+/// - **Core**: Forest structure + warmup (DynFrs OCC(q) 고정 k)
+/// - **Budget**: Budget management parameters (SUDA framework layer)
+/// - **Experimental**: Influence tracking + feature distance
 #[derive(Debug, Clone)]
 pub struct SUDAConfig {
     // ─── Core: Forest & Streaming ───────────────────────────────────────────
     pub num_trees: usize,
     pub k: usize,
+    /// Class-aware OCC(q) for minority (attack) class. 0 = disabled (use `k` for all).
+    /// > 0: positive-label samples assigned to up to `minority_k` trees so minority is
+    /// > learnable under extreme imbalance. Fixed two-value scheme (not dynamic Adaptive-k).
+    pub minority_k: usize,
     pub max_depth: u32,
     pub num_features: u8,
     pub seed: u64,
@@ -115,66 +123,47 @@ pub struct SUDAConfig {
     pub metrics_window: usize,
     /// Memory limit in bytes (default: 100MB). Oldest samples evicted when exceeded.
     pub memory_max_bytes: usize,
-    /// Adaptive-k: minority class gets higher OCC(q) redundancy
-    pub adaptive_k_enabled: bool,
-    pub k_min: usize,
-    pub k_max: usize,
 
-    // ─── Budget Management (key mechanism, see HOW > WHAT) ──────────────────
-    /// Enable continuous budget-based eviction
+    // ─── Budget Management ──────────────────────────────────────────────────
+    /// Enable continuous budget-based eviction.
     pub budget_enabled: bool,
-    /// Maximum samples in registry (optimal: 3000)
+    /// Maximum samples in registry (optimal: 3000).
     pub budget_max_samples: usize,
-    /// Samples to evict per batch when budget exceeded (default: 100)
+    /// Samples to evict per batch when budget exceeded (default: 100).
     pub budget_eviction_batch: usize,
-    /// Minority protection threshold (default: 0.1)
+    /// Minority protection threshold (default: 0.1) — eviction-side, not Adaptive-k.
     pub budget_minority_protection: f64,
-    /// Eviction score weights: age, influence, class penalty
+    /// Eviction score weights: age, influence, class penalty.
     pub budget_age_weight: f64,
     pub budget_influence_weight: f64,
     pub budget_class_weight: f64,
-    /// Ablation flag: skip forest.forget_batch() during eviction
+    /// Random eviction baseline (reservoir-style uniform random).
+    pub budget_random_eviction: bool,
+    /// Q2-1 ablation: class-aware random (minority protection ON, age signal randomized).
+    pub budget_class_aware_random: bool,
+    /// Ablation flag: skip forest.forget_batch() during eviction.
     pub budget_skip_forest_forget: bool,
-    /// Use feature-distance based eviction scoring instead of age-based FIFO.
+    /// Q2-2 ablation: naive sliding-window rebuild. 0 = disabled (exact incremental
+    /// forget). >0 = forest frozen between rebuilds, rebuilt from current buffer every
+    /// N samples. Isolates exact incremental unlearning vs periodic full retrain.
+    pub budget_rebuild_interval: usize,
+    /// Feature-distance based eviction scoring (centroid distance).
     pub budget_use_feature_distance: bool,
-    /// Window retrain mode: instead of exact forget, periodically retrain from buffer
-    pub window_retrain_mode: bool,
-    /// Window retrain interval: retrain every N eviction batches (default: 1)
-    pub window_retrain_interval: u64,
-    /// Use incremental retrain (reset + add_samples_streaming) instead of batch fit_weighted
-    pub window_retrain_incremental: bool,
 
     // ─── Experimental: Influence Tracking ───────────────────────────────────
-    /// Enable influence drift tracking (prev_influence updates)
+    /// Enable influence drift tracking (prev_influence updates).
     pub influence_tracking_enabled: bool,
-    /// How often to recompute influence scores (every N batches, 0 = disabled)
+    /// How often to recompute influence scores (every N batches, 0 = disabled).
     pub influence_update_interval: usize,
-    /// Number of samples to recompute per update
+    /// Number of samples to recompute per update.
     pub influence_sample_count: usize,
     /// Influence computation strategy:
     /// "none" = no influence (pure FIFO), "oob" = OOB influence,
     /// "loss" = cross-entropy loss, "confidence" = redundancy-based,
-    /// "cumulative_oob" = EMA of OOB, "feature_distance" = centroid distance
+    /// "cumulative_oob" = EMA of OOB, "feature_distance" = centroid distance.
     pub influence_strategy: String,
-    /// Feature distance update interval (samples, default 2000)
+    /// Feature distance update interval (samples, default 2000).
     pub feat_dist_update_interval: u64,
-
-    // ─── Experimental: Tree Rebuild ─────────────────────────────────────────
-    /// Periodic develop() interval (0 = disabled, N = every N batches)
-    pub develop_interval: u64,
-
-    // ─── Split Quality Monitoring ────────────────────────────────────────────
-    /// Split quality degradation threshold for forget-time monitoring.
-    /// When set, forget() checks if each internal node's weighted Gini has
-    /// degraded beyond this threshold from its creation-time value.
-    /// None = disabled (default, preserves existing behavior).
-    pub split_quality_threshold: Option<f64>,
-
-    /// Maximum age (in samples) for a split before forced rebuild during develop().
-    /// None = disabled (default). When set, internal nodes with
-    /// `total_samples - created_at > split_max_age` are automatically rebuilt,
-    /// addressing structural debt from gradual drift.
-    pub split_max_age: Option<u64>,
 }
 
 impl Default for SUDAConfig {
@@ -182,15 +171,13 @@ impl Default for SUDAConfig {
         Self {
             num_trees: 50,
             k: 10,
+            minority_k: 0,
             max_depth: 15,
             num_features: 41,
             seed: 42,
             memory_max_bytes: 100 * 1024 * 1024, // 100MB
             warmup_samples: 1000,
             metrics_window: 1000,
-            adaptive_k_enabled: true,
-            k_min: 3,
-            k_max: 50,
 
             // Budget management (disabled by default)
             budget_enabled: false,
@@ -211,24 +198,15 @@ impl Default for SUDAConfig {
             budget_age_weight: 0.4,
             budget_influence_weight: 0.4,
             budget_class_weight: 0.2,
+            budget_random_eviction: false,
+            budget_class_aware_random: false,
 
             // Ablation: skip forest forget
             budget_skip_forest_forget: false,
+            // Q2-2: naive rebuild disabled by default (exact incremental forget)
+            budget_rebuild_interval: 0,
             // Feature-distance eviction (disabled by default, uses FIFO)
             budget_use_feature_distance: false,
-            // Window retrain mode (disabled by default)
-            window_retrain_mode: false,
-            window_retrain_interval: 1,
-            window_retrain_incremental: false,
-
-            // Tree rebuild (develop) - every 5 batches by default
-            develop_interval: 5,
-
-            // Split quality monitoring (disabled by default)
-            split_quality_threshold: None,
-
-            // Age-based subtree refresh (disabled by default)
-            split_max_age: None,
         }
     }
 }
@@ -284,12 +262,12 @@ pub struct StreamingController {
     /// Last batch samples stored for influence recomputation (used as test samples)
     last_batch_samples: Vec<VecSample>,
 
-    /// Counter for periodic develop() calls to process pending LazyTags
-    batches_since_develop: u64,
-    /// Counter for window retrain interval
-    evictions_since_retrain: u64,
     /// Counter for feature-distance update (samples since last update)
     feature_distance_counter: u64,
+    /// Recent stream class ratio tracker (EMA of positive ratio in last batches)
+    stream_positive_ema: f64,
+    /// Q2-2: samples processed since last forest rebuild (naive sliding-window mode).
+    rebuild_counter: u64,
 }
 
 impl StreamingController {
@@ -302,29 +280,18 @@ impl StreamingController {
             min_samples_leaf: 1,
             max_features: None,
             num_splits_to_try: 10,
-            split_quality_threshold: config.split_quality_threshold,
-            ..Default::default()
         };
 
         let forest_config = ForestConfig {
             num_trees: config.num_trees,
             k: config.k,
+            minority_k: config.minority_k,
             tree_config,
             seed: config.seed,
         };
 
         // Create forest
-        let mut forest = DynFrsForest::new(forest_config, config.num_features);
-
-        // Configure adaptive k if enabled
-        if config.adaptive_k_enabled {
-            forest.set_adaptive_k_config(AdaptiveKConfig {
-                k_min: config.k_min,
-                k_max: config.k_max,
-                ratio_threshold: 0.3,
-                extreme_threshold: 0.01,
-            });
-        }
+        let forest = DynFrsForest::new(forest_config, config.num_features);
 
         // Create components
         let mut registry = InfluenceRegistry::with_max_bytes(config.memory_max_bytes);
@@ -338,6 +305,8 @@ impl StreamingController {
                 age_weight: config.budget_age_weight,
                 influence_weight: config.budget_influence_weight,
                 class_weight: config.budget_class_weight,
+                random_eviction: config.budget_random_eviction,
+                class_aware_random: config.budget_class_aware_random,
             });
         }
 
@@ -365,9 +334,9 @@ impl StreamingController {
             initial_fit_done: false,
             influence_update_counter: 0,
             last_batch_samples: Vec::new(),
-            batches_since_develop: 0,
-            evictions_since_retrain: 0,
             feature_distance_counter: 0,
+            stream_positive_ema: 0.5,
+            rebuild_counter: 0,
         }
     }
 
@@ -401,7 +370,7 @@ impl StreamingController {
 
         // 3. ADD NEW SAMPLES (budget eviction happens inside register())
         let eviction_before = self.registry.eviction_stats().evicted_count;
-        self.add_batch(features, labels);
+        self.add_batch(features, labels, None);
         let budget_evicted = self.registry.eviction_stats().evicted_count - eviction_before;
 
         // 4. PERIODIC MAINTENANCE (develop, influence, warmup)
@@ -436,15 +405,17 @@ impl StreamingController {
         }
     }
 
-    /// Periodic maintenance: develop trees, recompute influences, update warmup.
+    /// A1 (lazy resolve 일원화, 회장님 결정 1b): periodic_maintenance에서 develop 호출 제거.
+    /// 모든 stale split은 predict_batch 진입 시 path-amortized로 처리됨.
     fn periodic_maintenance(&mut self, batch_size: usize) {
         if self.is_warmed_up {
-            self.maybe_develop(false);
-
             // Periodic influence recomputation for budget eviction quality
             if self.config.budget_enabled && self.config.influence_update_interval > 0 {
                 self.influence_update_counter += 1;
-                if self.influence_update_counter % self.config.influence_update_interval as u64 == 0 {
+                if self
+                    .influence_update_counter
+                    .is_multiple_of(self.config.influence_update_interval as u64)
+                {
                     self.update_sample_influences();
                 }
             }
@@ -457,8 +428,11 @@ impl StreamingController {
         }
     }
 
-    /// Predict labels for a batch.
-    fn predict_batch(&self, features: &[Vec<f32>]) -> Vec<bool> {
+    /// Predict labels for a batch — A1 path-amortized lazy resolve (DynFrs qry() 정합).
+    ///
+    /// Fast path: 어떤 트리에도 pending rebuild 없으면 immutable par_iter predict.
+    /// Slow path: feature_store + registry로 active sample_map 구성 후 lazy resolve.
+    fn predict_batch(&mut self, features: &[Vec<f32>]) -> Vec<bool> {
         let samples: Vec<VecSample> = features
             .iter()
             .enumerate()
@@ -469,27 +443,128 @@ impl StreamingController {
             })
             .collect();
 
-        self.forest.predict_batch(&samples)
+        // Fast path: 정적 시나리오 — 기존 immutable par_iter predict
+        if !self.forest.has_pending_rebuilds() {
+            return self.forest.predict_batch(&samples);
+        }
+
+        // A1 slow path: query path 따라가며 만난 LazyTag 노드만 subtree rebuild
+        // sample_map 출처 = feature_store(features) + registry(label).
+        // budget eviction/forget 시 둘 다 동시 정리되므로 active 집합 정합.
+        let active_ids: Vec<u64> = self.feature_store.keys().copied().collect();
+        let active_samples: Vec<VecSample> = active_ids
+            .iter()
+            .filter_map(|&id| {
+                let f = self.feature_store.get_features(id)?;
+                let label = self.registry.get_label(id).unwrap_or(false);
+                Some(VecSample {
+                    id,
+                    values: f,
+                    label,
+                })
+            })
+            .collect();
+        let sample_map: HashMap<u64, &VecSample> =
+            active_samples.iter().map(|s| (s.id, s)).collect();
+
+        self.forest
+            .predict_batch_with_lazy_resolve(&samples, &sample_map)
     }
 
     /// Predict labels for a batch without updating any controller state.
-    pub fn predict_batch_only(&self, features: &[Vec<f32>]) -> Vec<bool> {
+    /// A1: lazy resolve를 위해 &mut self가 필요 (forest 내부 tree mutation).
+    pub fn predict_batch_only(&mut self, features: &[Vec<f32>]) -> Vec<bool> {
         if features.is_empty() {
             return Vec::new();
         }
         self.predict_batch(features)
     }
 
+    /// Probability version of `predict_batch` — same lazy-resolve path so forget's
+    /// split rebuild is reflected (gate: unlearning-as-attribution needs accurate proba).
+    fn predict_proba_batch(&mut self, features: &[Vec<f32>]) -> Vec<f64> {
+        let samples: Vec<VecSample> = features
+            .iter()
+            .enumerate()
+            .map(|(i, f)| VecSample {
+                id: i as u64,
+                values: f.clone(),
+                label: false,
+            })
+            .collect();
+
+        if !self.forest.has_pending_rebuilds() {
+            return self.forest.predict_proba_batch(&samples);
+        }
+
+        let active_ids: Vec<u64> = self.feature_store.keys().copied().collect();
+        let active_samples: Vec<VecSample> = active_ids
+            .iter()
+            .filter_map(|&id| {
+                let f = self.feature_store.get_features(id)?;
+                let label = self.registry.get_label(id).unwrap_or(false);
+                Some(VecSample {
+                    id,
+                    values: f,
+                    label,
+                })
+            })
+            .collect();
+        let sample_map: HashMap<u64, &VecSample> =
+            active_samples.iter().map(|s| (s.id, s)).collect();
+
+        self.forest
+            .predict_proba_batch_with_lazy_resolve(&samples, &sample_map)
+    }
+
+    /// PyO3-facing: proba batch without state update.
+    pub fn predict_proba_batch_only(&mut self, features: &[Vec<f32>]) -> Vec<f64> {
+        if features.is_empty() {
+            return Vec::new();
+        }
+        self.predict_proba_batch(features)
+    }
+
     /// Recompute influence scores for a subset of registry samples.
     /// Dispatches to the appropriate strategy based on config.influence_strategy.
     fn update_sample_influences(&mut self) {
+        // A1 (3b — 회장님 결정): OOB influence도 lazy resolve 거침.
+        // 모든 influence 전략(oob/loss/confidence/conflict)은 내부적으로
+        // forest의 immutable predict 호출에 의존 → resolved 상태에서 호출해야 정확.
+        //
+        // 트리거 방식: active sample 전체를 lazy resolve predict로 한 번 통과
+        // → 거의 모든 query path 노드가 resolve됨 → 이후 immutable 호출은 정확.
+        // (influence_update_interval=10이라 batch당 비용 아님)
+        if self.forest.has_pending_rebuilds() {
+            let active_ids: Vec<u64> = self.feature_store.keys().copied().collect();
+            let active_samples: Vec<VecSample> = active_ids
+                .iter()
+                .filter_map(|&id| {
+                    let f = self.feature_store.get_features(id)?;
+                    let label = self.registry.get_label(id).unwrap_or(false);
+                    Some(VecSample {
+                        id,
+                        values: f,
+                        label,
+                    })
+                })
+                .collect();
+            let sample_map: HashMap<u64, &VecSample> =
+                active_samples.iter().map(|s| (s.id, s)).collect();
+            // active sample을 query로 통과 → path-amortized resolve 트리거
+            let _ = self
+                .forest
+                .predict_batch_with_lazy_resolve(&active_samples, &sample_map);
+        }
+
         match self.config.influence_strategy.as_str() {
             "oob" => self.update_oob_influences(),
             "loss" => self.update_loss_based_influences(),
             "confidence" => self.update_confidence_influences(),
+            "conflict" => self.update_conflict_influences(),
             "cumulative_oob" => self.update_cumulative_oob_influences(),
-            "feature_distance" => {}, // handled in add_batch via update_feature_distance_scores
-            _ => {},  // "none" = no influence update
+            "feature_distance" => {} // handled in add_batch via update_feature_distance_scores
+            _ => {}                  // "none" = no influence update
         }
     }
 
@@ -498,17 +573,17 @@ impl StreamingController {
         if self.last_batch_samples.is_empty() {
             return;
         }
-        let sample_ids = self.registry.get_sample_ids_uniform(
-            self.config.influence_sample_count,
-        );
+        let sample_ids = self
+            .registry
+            .get_sample_ids_uniform(self.config.influence_sample_count);
         if sample_ids.is_empty() {
             return;
         }
         for &sample_id in &sample_ids {
-            if let Some(influence) = self.forest.compute_oob_influence_batch(
-                sample_id,
-                &self.last_batch_samples,
-            ) {
+            if let Some(influence) = self
+                .forest
+                .compute_oob_influence_batch(sample_id, &self.last_batch_samples)
+            {
                 self.registry.set_influence(sample_id, influence);
             }
         }
@@ -519,17 +594,17 @@ impl StreamingController {
         if self.last_batch_samples.is_empty() {
             return;
         }
-        let sample_ids = self.registry.get_sample_ids_uniform(
-            self.config.influence_sample_count,
-        );
+        let sample_ids = self
+            .registry
+            .get_sample_ids_uniform(self.config.influence_sample_count);
         if sample_ids.is_empty() {
             return;
         }
         for &sample_id in &sample_ids {
-            if let Some(influence) = self.forest.compute_loss_influence_batch(
-                sample_id,
-                &self.last_batch_samples,
-            ) {
+            if let Some(influence) = self
+                .forest
+                .compute_loss_influence_batch(sample_id, &self.last_batch_samples)
+            {
                 self.registry.set_influence(sample_id, influence);
             }
         }
@@ -537,9 +612,9 @@ impl StreamingController {
 
     /// Confidence-based: redundant samples (high model confidence) get low influence → evict first.
     fn update_confidence_influences(&mut self) {
-        let sample_ids = self.registry.get_sample_ids_uniform(
-            self.config.influence_sample_count,
-        );
+        let sample_ids = self
+            .registry
+            .get_sample_ids_uniform(self.config.influence_sample_count);
         if sample_ids.is_empty() {
             return;
         }
@@ -563,23 +638,69 @@ impl StreamingController {
         }
     }
 
+    /// Conflict-based influence: samples where model prediction DISAGREES with label.
+    ///
+    /// Key insight: After drift, old samples may have labels from the previous distribution.
+    /// The model has already adapted to the new distribution via streaming updates.
+    /// Samples whose labels CONFLICT with the model's current prediction are "stale" —
+    /// they are actively pulling predictions in the wrong direction.
+    ///
+    /// Influence score:
+    ///   conflict (pred ≠ label): -1.0 (most harmful → evict first)
+    ///   aligned  (pred = label):  0.0 (neutral)
+    ///   Scaled by prediction confidence for gradation.
+    fn update_conflict_influences(&mut self) {
+        // Score ALL registry samples (not just a subset) for accurate conflict detection
+        let sample_ids: Vec<u64> = self.registry.sample_ids();
+        if sample_ids.is_empty() {
+            return;
+        }
+        for &sample_id in &sample_ids {
+            if let Some(features) = self.feature_store.get_features(sample_id) {
+                if let Some(label) = self.registry.get_label(sample_id) {
+                    let sample = VecSample {
+                        id: sample_id,
+                        values: features,
+                        label,
+                    };
+                    let proba = self.forest.predict_proba(&sample);
+                    let predicted = proba > 0.5;
+
+                    if predicted != label {
+                        // CONFLICT: model disagrees with this sample's label
+                        // More confident disagreement → more negative influence → evict first
+                        let confidence = if predicted { proba } else { 1.0 - proba };
+                        let influence = -(confidence); // [-1.0, -0.5]
+                        self.registry.set_influence(sample_id, influence);
+                    } else {
+                        // ALIGNED: model agrees with this sample
+                        // More confident agreement → more positive → keep longer
+                        let confidence = if label { proba } else { 1.0 - proba };
+                        let influence = confidence - 0.5; // [0.0, 0.5]
+                        self.registry.set_influence(sample_id, influence);
+                    }
+                }
+            }
+        }
+    }
+
     /// Cumulative OOB: EMA of OOB influence for stable estimation.
     fn update_cumulative_oob_influences(&mut self) {
         if self.last_batch_samples.is_empty() {
             return;
         }
         let alpha = 0.3; // new value weight
-        let sample_ids = self.registry.get_sample_ids_uniform(
-            self.config.influence_sample_count,
-        );
+        let sample_ids = self
+            .registry
+            .get_sample_ids_uniform(self.config.influence_sample_count);
         if sample_ids.is_empty() {
             return;
         }
         for &sample_id in &sample_ids {
-            if let Some(new_inf) = self.forest.compute_oob_influence_batch(
-                sample_id,
-                &self.last_batch_samples,
-            ) {
+            if let Some(new_inf) = self
+                .forest
+                .compute_oob_influence_batch(sample_id, &self.last_batch_samples)
+            {
                 let old_inf = self.registry.get_influence(sample_id).unwrap_or(0.0);
                 let ema = alpha * new_inf + (1.0 - alpha) * old_inf;
                 self.registry.set_influence(sample_id, ema);
@@ -588,13 +709,34 @@ impl StreamingController {
     }
 
     /// Add a batch of samples with full tracking.
-    fn add_batch(&mut self, features: &[Vec<f32>], labels: &[bool]) {
+    fn add_batch(&mut self, features: &[Vec<f32>], labels: &[bool], ids: Option<&[u64]>) {
+        // Q2-2 naive sliding-window mode: forest is frozen between rebuilds. We skip
+        // incremental add/forget on the forest and instead rebuild it from the current
+        // buffer every `budget_rebuild_interval` samples. The registry still tracks the
+        // bounded buffer (same eviction policy), so the buffer composition matches the
+        // exact arm — only the forest-refresh mechanism differs.
+        let rebuild_mode = self.config.budget_enabled && self.config.budget_rebuild_interval > 0;
+
+        // Always track stream class ratio (used by conflict purge and forget-and-inject)
+        if !labels.is_empty() {
+            let batch_positive = labels.iter().filter(|&&l| l).count() as f64 / labels.len() as f64;
+            self.stream_positive_ema = 0.8 * self.stream_positive_ema + 0.2 * batch_positive;
+        }
+
         let samples: Vec<VecSample> = features
             .iter()
             .zip(labels.iter())
-            .map(|(f, &l)| {
-                let id = self.next_sample_id;
-                self.next_sample_id += 1;
+            .enumerate()
+            .map(|(i, (f, &l))| {
+                // External id (exact_mode retrain-equivalence) or auto-incremented id.
+                let id = match ids {
+                    Some(a) => a[i],
+                    None => {
+                        let id = self.next_sample_id;
+                        self.next_sample_id += 1;
+                        id
+                    }
+                };
 
                 let values = f.clone(); // Single clone
                 self.feature_store.insert(id, values.clone()); // Share via clone of owned
@@ -607,8 +749,11 @@ impl StreamingController {
             })
             .collect();
 
-        // Streaming add - always use streaming mode
-        let (_num_added, _needs_rebuild) = self.forest.add_samples_streaming(&samples, true);
+        // Exact arm: incrementally add to the forest. Rebuild arm: forest frozen until
+        // the next periodic rebuild, so skip the incremental add.
+        if !rebuild_mode {
+            let (_num_added, _needs_rebuild) = self.forest.add_samples_streaming(&samples, true);
+        }
 
         // Feature-distance eviction: compute centroid and set distances as influence scores
         // before registration so that eviction scoring uses distance instead of age.
@@ -617,72 +762,115 @@ impl StreamingController {
         if self.config.budget_use_feature_distance && self.config.budget_enabled {
             self.feature_distance_counter += samples.len() as u64;
             let near_capacity = self.feature_store.len() > (self.config.budget_max_samples * 4 / 5);
-            let interval_reached = self.feature_distance_counter >= self.config.feat_dist_update_interval;
+            let interval_reached =
+                self.feature_distance_counter >= self.config.feat_dist_update_interval;
             if near_capacity && interval_reached {
                 self.update_feature_distance_scores();
                 self.feature_distance_counter = 0;
             }
         }
 
-        // Register samples with their tree indices (batch optimized)
+        // Register samples with their tree indices (batch optimized).
+        // In rebuild mode the samples are not in the frozen forest yet, so tree_indices
+        // are empty until the next rebuild reassigns them (they are only used by the
+        // exact forget path, which rebuild mode never calls).
         let sample_ids: Vec<u64> = samples.iter().map(|s| s.id).collect();
-        let tree_indices_list: Vec<Vec<usize>> = samples
-            .iter()
-            .map(|s| self.forest.get_sample_tree_indices(s.id))
-            .collect();
+        let tree_indices_list: Vec<Vec<usize>> = if rebuild_mode {
+            vec![Vec::new(); samples.len()]
+        } else {
+            samples
+                .iter()
+                .map(|s| self.forest.get_sample_tree_indices(s.id))
+                .collect()
+        };
         let labels: Vec<bool> = samples.iter().map(|s| s.label).collect();
-        let all_evicted = self.registry.register_batch(&sample_ids, &tree_indices_list, &labels);
+        let all_evicted = self
+            .registry
+            .register_batch(&sample_ids, &tree_indices_list, &labels);
         self.position += samples.len() as u64;
 
         // Forget budget-evicted samples from the forest (critical for actual model impact)
         if !all_evicted.is_empty() {
-            if self.config.window_retrain_mode {
-                // Window Retrain path: remove from feature_store, then periodically retrain
+            if rebuild_mode || self.config.budget_skip_forest_forget {
+                // Rebuild mode: no incremental forget — the periodic rebuild below drops
+                // evicted samples. skip_forest_forget ablation: registry-only eviction.
+                // Either way, just clean up the feature store.
                 for &id in &all_evicted {
                     self.feature_store.remove(id);
                 }
-                self.evictions_since_retrain += 1;
-                if self.evictions_since_retrain >= self.config.window_retrain_interval {
-                    self.retrain_from_window();
-                    self.evictions_since_retrain = 0;
-                }
-            } else if !self.config.budget_skip_forest_forget {
-                // Exact Forget path: streaming-aware forget updates attribute statistics
-                let feature_map: HashMap<u64, Vec<f32>> = all_evicted.iter()
-                    .filter_map(|&id| self.feature_store.get_features(id).map(|f| (id, f.to_vec())))
-                    .collect();
-                self.forest.forget_batch_with_features(&all_evicted, &feature_map);
-                // Also remove from feature store
-                for &id in &all_evicted {
-                    self.feature_store.remove(id);
-                }
-                // Force develop after budget eviction (forget invalidates splits)
-                self.run_develop();
             } else {
-                // No-Forest-Forget ablation: registry-only eviction
+                // forest.forget_batch → tree.remove_sample_streaming →
+                // streaming_states.attr_stats 갱신 → best_split_changed 자동 감지
+                // → LazyTag::Rebuild 마킹 → 다음 query에서 lazy resolve로 처리.
+                let mut feature_map: hashbrown::HashMap<u64, Vec<f32>> = hashbrown::HashMap::new();
+                for &id in &all_evicted {
+                    if let Some(f) = self.feature_store.get_features(id) {
+                        feature_map.insert(id, f);
+                    }
+                }
+                self.forest.forget_batch(&all_evicted, &feature_map);
                 for &id in &all_evicted {
                     self.feature_store.remove(id);
                 }
             }
         }
+
+        // Q2-2: periodic full rebuild from the current buffer (naive sliding-window).
+        if rebuild_mode {
+            self.rebuild_counter += samples.len() as u64;
+            if self.rebuild_counter >= self.config.budget_rebuild_interval as u64 {
+                self.rebuild_forest_from_buffer();
+                self.rebuild_counter = 0;
+            }
+        }
     }
 
-    /// Collect current samples from feature_store + forest for develop().
-    /// Only collects samples that are both in the forest and feature_store.
-    fn collect_current_samples(&self) -> Vec<VecSample> {
-        self.forest
-            .get_all_sample_ids()
-            .into_iter()
-            .filter_map(|id| {
-                let features = self.feature_store.get_features(id)?;
-                let label = self.forest.get_sample_label(id)?;
-                Some(VecSample {
-                    id,
-                    values: features,
-                    label,
-                })
-            })
-            .collect()
+    /// Q2-2 naive sliding-window baseline: rebuild the forest from scratch using the
+    /// current registry buffer (≤ budget_max_samples). Forest size stays bounded, so
+    /// there is no unbounded-accumulation overflow. Reuses existing sample ids; updates
+    /// registry tree_indices so the buffer stays consistent with the new forest.
+    fn rebuild_forest_from_buffer(&mut self) {
+        let ids: Vec<u64> = self.registry.current_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let mut samples: Vec<VecSample> = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            if let (Some(values), Some(label)) = (
+                self.feature_store.get_features(id),
+                self.registry.get_label(id),
+            ) {
+                samples.push(VecSample { id, values, label });
+            }
+        }
+        if samples.is_empty() {
+            return;
+        }
+
+        let tree_config = TreeConfig {
+            max_depth: self.config.max_depth as usize,
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+            max_features: None,
+            num_splits_to_try: 10,
+        };
+        let forest_config = ForestConfig {
+            num_trees: self.config.num_trees,
+            k: self.config.k,
+            minority_k: self.config.minority_k,
+            tree_config,
+            seed: self.config.seed,
+        };
+        let mut forest = DynFrsForest::new(forest_config, self.config.num_features);
+        forest.fit(&samples);
+        forest.enable_streaming(&samples);
+
+        // Refresh registry tree assignments to match the new forest.
+        for s in &samples {
+            let ti = forest.get_sample_tree_indices(s.id);
+            self.registry.set_tree_indices(s.id, ti);
+        }
+        self.forest = forest;
     }
 
     /// Compute feature-distance scores for all samples in the registry.
@@ -698,19 +886,15 @@ impl StreamingController {
         // Compute centroid of the most recent 1000 samples by position.
         // Use select_nth_unstable for O(n) partitioning instead of O(n log n) sort.
         let n_recent = 1000.min(all_ids.len());
-        let mut recent_positions: Vec<(u64, u64)> = all_ids.iter()
-            .filter_map(|&id| {
-                self.registry.get(id)
-                    .map(|t| (id, t.position))
-            })
+        let mut recent_positions: Vec<(u64, u64)> = all_ids
+            .iter()
+            .filter_map(|&id| self.registry.get(id).map(|t| (id, t.position)))
             .collect();
 
         if recent_positions.len() > n_recent {
             // Partition: top n_recent by position (descending = largest positions)
-            recent_positions.select_nth_unstable_by_key(
-                n_recent,
-                |&(_, pos)| std::cmp::Reverse(pos),
-            );
+            recent_positions
+                .select_nth_unstable_by_key(n_recent, |&(_, pos)| std::cmp::Reverse(pos));
             recent_positions.truncate(n_recent);
         }
 
@@ -718,6 +902,7 @@ impl StreamingController {
         let mut cnt = 0usize;
         for &(id, _) in &recent_positions {
             if let Some(f) = self.feature_store.get_features(id) {
+                let f: Vec<f32> = f;
                 for (c, &v) in centroid.iter_mut().zip(f.iter()) {
                     *c += v as f64;
                 }
@@ -734,7 +919,10 @@ impl StreamingController {
         // Set negative distance as influence for all samples
         for &id in &all_ids {
             if let Some(f) = self.feature_store.get_features(id) {
-                let dist: f64 = f.iter().zip(centroid.iter())
+                let f: Vec<f32> = f;
+                let dist: f64 = f
+                    .iter()
+                    .zip(centroid.iter())
                     .map(|(&v, &c)| (v as f64 - c).powi(2))
                     .sum::<f64>()
                     .sqrt();
@@ -745,92 +933,8 @@ impl StreamingController {
         }
     }
 
-    /// Retrain the forest from the current window (feature_store samples).
-    /// Used in window_retrain_mode as an alternative to exact forget.
-    fn retrain_from_window(&mut self) {
-        // Collect samples from feature_store + registry (labels come from registry)
-        let samples: Vec<VecSample> = self.feature_store
-            .keys()
-            .filter_map(|&id| {
-                let features = self.feature_store.get_features(id)?;
-                let tracked = self.registry.get(id)?;
-                Some(VecSample {
-                    id,
-                    values: features,
-                    label: tracked.label,
-                })
-            })
-            .collect();
-
-        if samples.is_empty() {
-            return;
-        }
-
-        // Compute class ratio for Adaptive-k
-        let positive_count = samples.iter().filter(|s| s.label).count();
-        let positive_ratio = positive_count as f64 / samples.len() as f64;
-
-        if self.config.window_retrain_incremental {
-            // Incremental retrain: reset trees + re-add samples via streaming
-            self.forest.reset();
-            self.forest.init_streaming_class_k_with_counts(positive_ratio, samples.len() as u64);
-            self.forest.add_samples_streaming(&samples, true);
-            // develop to process any pending LazyTags from streaming adds
-            self.forest.develop_streaming(&samples);
-        } else {
-            // Batch retrain: full fit_weighted (destroys + rebuilds all trees)
-            self.forest.fit_weighted(&samples, positive_ratio);
-            self.forest.init_streaming_class_k_with_counts(positive_ratio, samples.len() as u64);
-        }
-
-        // Sync registry tree_indices with new OCC mapping after retrain
-        for sample in &samples {
-            let new_tree_indices = self.forest.get_sample_tree_indices(sample.id);
-            if let Some(tracked) = self.registry.get_mut(sample.id) {
-                tracked.tree_indices = new_tree_indices;
-            }
-        }
-    }
-
-    /// Run develop() to process pending LazyTags (Dirty/Rebuild) in trees.
-    /// This rebuilds stale splits after add/forget operations.
-    /// When split_max_age is configured, also rebuilds splits older than the threshold.
-    fn run_develop(&mut self) {
-        let has_age_refresh = self.config.split_max_age.is_some();
-
-        // If no age refresh, skip if nothing pending
-        if !has_age_refresh && !self.forest.has_pending_rebuilds() {
-            return;
-        }
-
-        let samples = self.collect_current_samples();
-        if !samples.is_empty() {
-            if has_age_refresh {
-                self.forest.develop_streaming_with_age(
-                    &samples,
-                    self.total_samples,
-                    self.config.split_max_age,
-                );
-            } else {
-                self.forest.develop_streaming(&samples);
-            }
-        }
-        self.batches_since_develop = 0;
-    }
-
-    /// Conditionally run develop based on interval or force flag.
-    fn maybe_develop(&mut self, force: bool) {
-        if force {
-            self.run_develop();
-            return;
-        }
-        if self.config.develop_interval > 0 {
-            self.batches_since_develop += 1;
-            if self.batches_since_develop >= self.config.develop_interval {
-                self.run_develop();
-            }
-        }
-    }
+    //   lazy resolve로 일원화. 모든 stale split은 predict_batch 진입 시 처리.
+    //   (forget_and_inject / Conflict Purge / split_max_age도 함께 제거됨)
 
     /// Pre-train on historical data.
     pub fn fit(&mut self, features: &[Vec<f32>], labels: &[bool]) -> StreamingMetrics {
@@ -858,46 +962,52 @@ impl StreamingController {
             })
             .collect();
 
-        let positive_count = labels.iter().filter(|&&l| l).count();
-        let positive_ratio = positive_count as f64 / n_samples as f64;
-
         #[cfg(debug_assertions)]
-        eprintln!(
-            "[SUDA] Pre-training: {} samples, {} positive ({:.2}%)",
-            n_samples,
-            positive_count,
-            positive_ratio * 100.0
-        );
-
-        // fit_weighted handles Adaptive-k internally
-        self.forest.fit_weighted(&samples, positive_ratio);
-
-        // Initialize streaming class k for Adaptive-k (for subsequent streaming adds)
-        self.forest.init_streaming_class_k_with_counts(positive_ratio, n_samples as u64);
-
-        // Register all samples with tree indices.
-        // During fit() (batch warmup), we intentionally do NOT remove evicted
-        // samples from the forest. The forest was just built with all warmup data
-        // and should retain that knowledge. The registry tracks the budget window
-        // for subsequent streaming-phase eviction. Forest-level forget only
-        // applies during streaming (stream_batch / process_batch).
-        for sample in &samples {
-            let tree_indices = self.forest.get_sample_tree_indices(sample.id);
-            let _evicted = self.registry.register(sample.id, tree_indices, sample.label);
-            self.position += 1;
+        {
+            let positive_count = labels.iter().filter(|&&l| l).count();
+            let positive_ratio = positive_count as f64 / n_samples as f64;
+            eprintln!(
+                "[SUDA] Pre-training: {} samples, {} positive ({:.2}%)",
+                n_samples,
+                positive_count,
+                positive_ratio * 100.0
+            );
         }
 
-        // CRITICAL: Enable streaming mode for incremental split updates.
+        self.forest.fit(&samples);
+
+        // Register all warmup samples into registry using batch registration.
+        // During fit(), we intentionally do NOT remove evicted samples from the
+        // forest — it was just built with all warmup data and should retain that
+        // knowledge. The registry tracks the budget window for subsequent
+        // streaming-phase eviction.
         //
-        // This initializes per-node StreamingNodeState with attribute statistics
-        // so that subsequent add_sample_streaming() calls can:
-        //   1. Update split statistics along the insertion path
-        //   2. Detect when the best split has changed → mark LazyTag::Rebuild
-        //   3. Check if leaves should split (growth)
+        // Using register_batch() (instead of per-sample register()) ensures that
+        // budget enforcement happens ONCE at the end with all samples present.
+        // This produces a registry whose class distribution matches the tail of
+        // the warmup data (pure FIFO behavior), rather than being biased by
+        // repeated enforcement during registration.
+        let sample_ids: Vec<u64> = samples.iter().map(|s| s.id).collect();
+        let tree_indices_list: Vec<Vec<usize>> = samples
+            .iter()
+            .map(|s| self.forest.get_sample_tree_indices(s.id))
+            .collect();
+        let sample_labels: Vec<bool> = samples.iter().map(|s| s.label).collect();
+        let _evicted =
+            self.registry
+                .register_batch_fifo(&sample_ids, &tree_indices_list, &sample_labels);
+        self.position += samples.len() as u64;
+
         //
-        // Without this call, streaming_enabled remains false and splits are
-        // frozen after fit(), causing significant performance degradation
-        // on long streams (e.g., ANoShift: 0.90 → 0.94 with this fix).
+        // 이전: SUDA Core audit에서 enable_streaming이 명시적 DISABLED였음. 그 의도는
+        // "forget을 유일 적응 채널로 만들어 unlearning 효과를 isolated 측정"이었으나,
+        // 부작용으로 (a) forget이 streaming-aware 경로 못 타고 leaf-only update (b)
+        // best_split_changed 자동 감지 안 됨 → LazyTag::Rebuild 마킹 안 됨 → develop이
+        // pending_rebuilds 체크에서 skip → 결과적으로 forget의 진짜 능력(surgical
+        // structure rebuild)이 한 번도 leverage되지 않음.
+        //
+        // 결정: enable_streaming을 켜고 forget을 streaming-aware 경로로 전달해
+        // streaming_states를 갱신한다. DynFrs의 add/del 자동 split 재평가가 작동.
         self.forest.enable_streaming(&samples);
 
         self.is_warmed_up = true;
@@ -961,6 +1071,27 @@ impl StreamingController {
         &mut self.registry
     }
 
+    /// Explicitly forget samples (exact unlearning): remove from forest trees,
+    /// registry, and feature store. Returns number forgotten from the forest.
+    /// Used for retrain-equivalence measurement and on-demand deletion requests.
+    ///
+    /// (streaming-aware): features를 feature_store에서 조회해 streaming-aware forget 경로 사용.
+    /// → streaming_states.attr_stats 갱신 + best_split_changed 감지 + LazyTag 마킹.
+    pub fn forget_samples(&mut self, sample_ids: &[u64]) -> usize {
+        let mut feature_map: hashbrown::HashMap<u64, Vec<f32>> = hashbrown::HashMap::new();
+        for &id in sample_ids {
+            if let Some(f) = self.feature_store.get_features(id) {
+                feature_map.insert(id, f);
+            }
+        }
+        let n = self.forest.forget_batch(sample_ids, &feature_map);
+        self.registry.remove_batch(sample_ids);
+        for &id in sample_ids {
+            self.feature_store.remove(id);
+        }
+        n
+    }
+
     /// Reset the controller.
     pub fn reset(&mut self) {
         self.forest.reset();
@@ -974,9 +1105,15 @@ impl StreamingController {
         self.initial_fit_done = false;
         self.influence_update_counter = 0;
         self.last_batch_samples.clear();
-        self.batches_since_develop = 0;
-        self.evictions_since_retrain = 0;
         self.feature_distance_counter = 0;
+        self.stream_positive_ema = 0.5;
+    }
+
+    /// Diagnostic: cumulative (add-path, forget-path) rebuild-trigger marks from
+    /// the forest. Q2-2 diagnostic — confirms whether exact forget's structure
+    /// refresh (`best_split_changed → LazyTag::Rebuild`) actually fires under drift.
+    pub fn rebuild_mark_counts(&self) -> (u64, u64) {
+        self.forest.rebuild_mark_counts()
     }
 
     /// Check if budget mode is enabled.
@@ -992,7 +1129,12 @@ impl StreamingController {
     /// Get budget eviction stats.
     pub fn budget_eviction_stats(&self) -> (usize, usize, usize, usize) {
         let stats = self.registry.eviction_stats();
-        (stats.evicted_count, stats.evicted_benign, stats.evicted_attack, stats.evicted_degraded)
+        (
+            stats.evicted_count,
+            stats.evicted_benign,
+            stats.evicted_attack,
+            stats.evicted_degraded,
+        )
     }
 
     /// Check if influence tracking is enabled.
@@ -1020,7 +1162,6 @@ mod tests {
         let config = SUDAConfig::default();
         assert_eq!(config.num_trees, 50);
         assert_eq!(config.k, 10);
-        assert!(config.adaptive_k_enabled);
     }
 
     #[test]
@@ -1149,14 +1290,19 @@ mod tests {
         // Stream enough to exceed budget
         let mut total_evicted = 0u64;
         for batch in 0..10 {
-            let batch_features: Vec<Vec<f32>> = (0..10).map(|i| vec![(batch * 10 + i) as f32; 4]).collect();
+            let batch_features: Vec<Vec<f32>> =
+                (0..10).map(|i| vec![(batch * 10 + i) as f32; 4]).collect();
             let batch_labels: Vec<bool> = (0..10).map(|i| i % 3 == 0).collect();
             let result = controller.stream_batch(&batch_features, &batch_labels);
             total_evicted += result.budget_evicted as u64;
         }
 
         // Registry should be around budget limit
-        assert!(controller.registry_size() <= 60, "Registry {} should be near budget 50", controller.registry_size());
+        assert!(
+            controller.registry_size() <= 60,
+            "Registry {} should be near budget 50",
+            controller.registry_size()
+        );
         assert!(total_evicted > 0, "Should have evicted some samples");
     }
 }
@@ -1198,14 +1344,12 @@ impl PyStreamingController {
         let num_features: u8 = get(config, "num_features", 41)?;
         let num_trees: usize = get(config, "num_trees", 50)?;
         let k: usize = get(config, "k", 10)?;
+        let minority_k: usize = get(config, "minority_k", 0)?;
         let max_depth: u32 = get(config, "max_depth", 15)?;
         let memory_limit_mb: usize = get(config, "memory_limit_mb", 100)?;
         let seed: u64 = get(config, "seed", 42)?;
         let warmup_samples: usize = get(config, "warmup_samples", 1000)?;
         let metrics_window: usize = get(config, "metrics_window", 1000)?;
-        let adaptive_k_enabled: bool = get(config, "adaptive_k_enabled", true)?;
-        let k_min: usize = get(config, "k_min", 3)?;
-        let k_max: usize = get(config, "k_max", 50)?;
 
         // Budget
         let budget_enabled: bool = get(config, "budget_enabled", false)?;
@@ -1215,7 +1359,10 @@ impl PyStreamingController {
         let budget_age_weight: f64 = get(config, "budget_age_weight", 0.4)?;
         let budget_influence_weight: f64 = get(config, "budget_influence_weight", 0.4)?;
         let budget_class_weight: f64 = get(config, "budget_class_weight", 0.2)?;
+        let budget_random_eviction: bool = get(config, "budget_random_eviction", false)?;
+        let budget_class_aware_random: bool = get(config, "budget_class_aware_random", false)?;
         let budget_skip_forest_forget: bool = get(config, "budget_skip_forest_forget", false)?;
+        let budget_rebuild_interval: usize = get(config, "budget_rebuild_interval", 0)?;
         let budget_use_feature_distance: bool = get(config, "budget_use_feature_distance", false)?;
 
         // Influence tracking
@@ -1226,19 +1373,14 @@ impl PyStreamingController {
         let feat_dist_update_interval: u64 = get(config, "feat_dist_update_interval", 2000)?;
 
         // Window retrain
-        let window_retrain_mode: bool = get(config, "window_retrain_mode", false)?;
-        let window_retrain_interval: u64 = get(config, "window_retrain_interval", 1)?;
-        let window_retrain_incremental: bool = get(config, "window_retrain_incremental", false)?;
 
         // Develop
-        let develop_interval: u64 = get(config, "develop_interval", 5)?;
 
         // Split quality monitoring
-        let split_quality_threshold: Option<f64> = get(config, "split_quality_threshold", None)?;
 
         // Age-based subtree refresh: None (0) = disabled
-        let split_max_age_raw: u64 = get(config, "split_max_age", 0)?;
-        let split_max_age = if split_max_age_raw == 0 { None } else { Some(split_max_age_raw) };
+
+        // Conflict purge (budget-free selective unlearning)
 
         // Memory limit: 0 means effectively unlimited (usize::MAX)
         let memory_max_bytes = if memory_limit_mb == 0 {
@@ -1250,15 +1392,13 @@ impl PyStreamingController {
         let config = SUDAConfig {
             num_trees,
             k,
+            minority_k,
             max_depth,
             num_features,
             seed,
             memory_max_bytes,
             warmup_samples,
             metrics_window,
-            adaptive_k_enabled,
-            k_min,
-            k_max,
             budget_enabled,
             budget_max_samples,
             budget_eviction_batch,
@@ -1266,19 +1406,16 @@ impl PyStreamingController {
             budget_age_weight,
             budget_influence_weight,
             budget_class_weight,
+            budget_random_eviction,
+            budget_class_aware_random,
             influence_tracking_enabled: influence_tracking,
             influence_update_interval,
             influence_sample_count,
             influence_strategy,
             feat_dist_update_interval,
             budget_skip_forest_forget,
+            budget_rebuild_interval,
             budget_use_feature_distance,
-            window_retrain_mode,
-            window_retrain_interval,
-            window_retrain_incremental,
-            develop_interval,
-            split_quality_threshold,
-            split_max_age,
         };
 
         Ok(PyStreamingController {
@@ -1394,10 +1531,8 @@ impl PyStreamingController {
     }
 
     /// Predict labels without updating training state or metrics.
-    fn predict_batch(
-        &self,
-        x: PyReadonlyArray2<f32>,
-    ) -> PyResult<Vec<bool>> {
+    /// P8b-3: lazy resolve를 위해 &mut self가 필요.
+    fn predict_batch(&mut self, x: PyReadonlyArray2<f32>) -> PyResult<Vec<bool>> {
         let x_array = x.as_array();
         let n_samples = x_array.nrows();
         let n_features = x_array.ncols();
@@ -1407,6 +1542,26 @@ impl PyStreamingController {
             .collect();
 
         Ok(self.inner.predict_batch_only(&features))
+    }
+
+    /// Predict positive-vote ratio (probability) without updating state.
+    /// gate(unlearning-as-attribution): forget의 split rebuild를 반영한 정확한 확률.
+    fn predict_proba_batch(&mut self, x: PyReadonlyArray2<f32>) -> PyResult<Vec<f64>> {
+        let x_array = x.as_array();
+        let n_samples = x_array.nrows();
+        let n_features = x_array.ncols();
+
+        let features: Vec<Vec<f32>> = (0..n_samples)
+            .map(|i| (0..n_features).map(|j| x_array[[i, j]]).collect())
+            .collect();
+
+        Ok(self.inner.predict_proba_batch_only(&features))
+    }
+
+    /// Explicitly forget samples (exact unlearning): remove from forest/registry/
+    /// feature_store. Returns number forgotten. For retrain-equivalence and deletion.
+    fn forget_samples(&mut self, sample_ids: Vec<u64>) -> usize {
+        self.inner.forget_samples(&sample_ids)
     }
 
     /// Get total samples processed.
@@ -1451,6 +1606,13 @@ impl PyStreamingController {
         self.inner.budget_enabled()
     }
 
+    /// Diagnostic: cumulative (add_rebuild_marks, forget_rebuild_marks).
+    /// Q2-2 — does exact forget's subtree-refresh trigger actually fire?
+    #[getter]
+    fn rebuild_mark_counts(&self) -> (u64, u64) {
+        self.inner.rebuild_mark_counts()
+    }
+
     /// Get total samples evicted by budget management.
     #[getter]
     fn total_budget_evicted(&self) -> usize {
@@ -1465,6 +1627,13 @@ impl PyStreamingController {
     /// Get influence coverage: (samples_with_influence, total_samples).
     fn get_influence_coverage(&self) -> (usize, usize) {
         self.inner.influence_coverage()
+    }
+
+    /// Snapshot of (sample_id, cached_influence) for all currently-tracked
+    /// samples with a computed influence. Read-only; used by detection-recall
+    /// analysis to rank samples by the endogenous conflict/oob signal.
+    fn get_cached_influences(&self) -> Vec<(u64, f64)> {
+        self.inner.registry().cached_influences()
     }
 
     /// Get extended budget eviction stats including influence diagnostics.
@@ -1510,10 +1679,14 @@ impl PyStreamingController {
                 let dict = PyDict::new(py);
                 dict.set_item("id", s.id).unwrap();
                 dict.set_item("label", s.label).unwrap();
-                dict.set_item("insertion_position", s.insertion_position).unwrap();
-                dict.set_item("influence_history", s.influence_history.clone()).unwrap();
-                dict.set_item("removal_rank_history", s.removal_rank_history.clone()).unwrap();
-                dict.set_item("average_influence", s.average_influence).unwrap();
+                dict.set_item("insertion_position", s.insertion_position)
+                    .unwrap();
+                dict.set_item("influence_history", s.influence_history.clone())
+                    .unwrap();
+                dict.set_item("removal_rank_history", s.removal_rank_history.clone())
+                    .unwrap();
+                dict.set_item("average_influence", s.average_influence)
+                    .unwrap();
                 dict.set_item("influence_trend", s.influence_trend).unwrap();
                 dict
             })
@@ -1522,13 +1695,21 @@ impl PyStreamingController {
     }
 
     /// Get core concept samples (consistently positive influence).
-    fn get_core_concept_samples(&self, min_observations: usize, min_avg_influence: f64) -> Vec<u64> {
-        self.inner.registry.get_core_concept_samples(min_observations, min_avg_influence)
+    fn get_core_concept_samples(
+        &self,
+        min_observations: usize,
+        min_avg_influence: f64,
+    ) -> Vec<u64> {
+        self.inner
+            .registry
+            .get_core_concept_samples(min_observations, min_avg_influence)
     }
 
     /// Get samples with declining influence over time.
     fn get_declining_samples(&self, min_observations: usize) -> Vec<(u64, f64)> {
-        self.inner.registry.get_declining_influence_samples(min_observations)
+        self.inner
+            .registry
+            .get_declining_influence_samples(min_observations)
     }
 
     /// Get longest surviving samples.
@@ -1538,12 +1719,16 @@ impl PyStreamingController {
 
     /// Get high-risk samples (frequently near removal).
     fn get_high_risk_samples(&self, top_n: usize, min_risk_count: usize) -> Vec<(u64, usize)> {
-        self.inner.registry.get_high_risk_samples(top_n, min_risk_count)
+        self.inner
+            .registry
+            .get_high_risk_samples(top_n, min_risk_count)
     }
 
     /// Get samples with stable influence (low variance).
     fn get_stable_samples(&self, max_variance: f64, min_observations: usize) -> Vec<u64> {
-        self.inner.registry.get_stable_influence_samples(max_variance, min_observations)
+        self.inner
+            .registry
+            .get_stable_influence_samples(max_variance, min_observations)
     }
 
     /// Record influence scores for analysis (call during selection).

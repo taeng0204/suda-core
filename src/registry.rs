@@ -40,6 +40,15 @@ pub struct BudgetConfig {
     pub influence_weight: f64,
     /// Weight for class penalty (higher = more minority protection)
     pub class_weight: f64,
+    /// Reservoir baseline: evict uniformly at random instead of by composite score.
+    /// Ignores age/influence/class. Used as a CL baseline (random retention)
+    /// to isolate the contribution of drift-aware selection. Default false.
+    pub random_eviction: bool,
+    /// Q2-1 ablation: keep class_penalty + protection_factor identical to the
+    /// composite path, but replace the age signal (norm_age) with a uniform
+    /// random value. Isolates "does age-based selection add anything beyond
+    /// minority protection?". Default false.
+    pub class_aware_random: bool,
 }
 
 impl Default for BudgetConfig {
@@ -51,6 +60,8 @@ impl Default for BudgetConfig {
             age_weight: 0.4,
             influence_weight: 0.4,
             class_weight: 0.2,
+            random_eviction: false,
+            class_aware_random: false,
         }
     }
 }
@@ -178,8 +189,14 @@ impl TrackedSample {
             return None;
         }
         let n = self.influence_history.len();
-        let first_half: f64 = self.influence_history[..n/2].iter().map(|(_, inf)| inf).sum();
-        let second_half: f64 = self.influence_history[n/2..].iter().map(|(_, inf)| inf).sum();
+        let first_half: f64 = self.influence_history[..n / 2]
+            .iter()
+            .map(|(_, inf)| inf)
+            .sum();
+        let second_half: f64 = self.influence_history[n / 2..]
+            .iter()
+            .map(|(_, inf)| inf)
+            .sum();
         let first_avg = first_half / (n / 2) as f64;
         let second_avg = second_half / (n - n / 2) as f64;
         Some(second_avg - first_avg)
@@ -187,9 +204,11 @@ impl TrackedSample {
 
     /// Get the number of times this sample was in top-N removal candidates.
     pub fn removal_risk_count(&self, top_n: usize) -> usize {
-        self.removal_rank_history.iter().filter(|(_, rank)| *rank < top_n).count()
+        self.removal_rank_history
+            .iter()
+            .filter(|(_, rank)| *rank < top_n)
+            .count()
     }
-
 }
 
 /// Sample lifecycle data for analysis export.
@@ -273,6 +292,13 @@ impl InfluenceRegistry {
         self.budget_config = Some(config);
     }
 
+    /// Dynamically adjust the budget max_samples (for adaptive budget).
+    pub fn set_budget_max_samples(&mut self, max_samples: usize) {
+        if let Some(ref mut config) = self.budget_config {
+            config.max_samples = max_samples;
+        }
+    }
+
     /// Enable influence tracking (prev_influence updates on set_influence).
     pub fn set_influence_tracking(&mut self, enabled: bool) {
         self.influence_tracking_enabled = enabled;
@@ -281,24 +307,14 @@ impl InfluenceRegistry {
     /// Register a new sample with its tree indices.
     ///
     /// Returns the evicted sample IDs if any (in fixed limit mode).
-    pub fn register(
-        &mut self,
-        sample_id: u64,
-        tree_indices: Vec<usize>,
-        label: bool,
-    ) -> Vec<u64> {
+    pub fn register(&mut self, sample_id: u64, tree_indices: Vec<usize>, label: bool) -> Vec<u64> {
         self.register_internal(sample_id, tree_indices, label);
         self.enforce_limits()
     }
 
     /// Register a sample without triggering budget/memory enforcement.
     /// Use this in batch operations where enforcement should happen once at the end.
-    fn register_internal(
-        &mut self,
-        sample_id: u64,
-        tree_indices: Vec<usize>,
-        label: bool,
-    ) {
+    fn register_internal(&mut self, sample_id: u64, tree_indices: Vec<usize>, label: bool) {
         let position = self.current_position;
         self.current_position += 1;
         self.total_registered += 1;
@@ -343,6 +359,46 @@ impl InfluenceRegistry {
         }
 
         self.enforce_limits()
+    }
+
+    /// Register a batch using pure FIFO eviction (no composite scoring).
+    ///
+    /// Used during fit() warmup to ensure the registry's class distribution
+    /// faithfully reflects the tail of the warmup data, without class-weighted
+    /// scoring bias that can lock in the initial distribution.
+    pub fn register_batch_fifo(
+        &mut self,
+        sample_ids: &[u64],
+        tree_indices_list: &[Vec<usize>],
+        labels: &[bool],
+    ) -> Vec<u64> {
+        for ((&id, indices), &label) in sample_ids
+            .iter()
+            .zip(tree_indices_list.iter())
+            .zip(labels.iter())
+        {
+            self.register_internal(id, indices.clone(), label);
+        }
+
+        // Pure FIFO: evict oldest samples until within budget
+        let max_samples = self
+            .budget_config
+            .as_ref()
+            .map(|c| c.max_samples)
+            .unwrap_or(usize::MAX);
+
+        let mut evicted = Vec::new();
+        while self.samples.len() > max_samples && !self.position_index.is_empty() {
+            if let Some((&oldest_pos, &oldest_id)) = self.position_index.iter().next() {
+                if let Some(sample) = self.samples.remove(&oldest_id) {
+                    self.current_bytes -= sample.memory_bytes();
+                    self.class_counts[sample.label as usize] -= 1;
+                    self.position_index.remove(&oldest_pos);
+                    evicted.push(oldest_id);
+                }
+            }
+        }
+        evicted
     }
 
     /// Enforce budget and memory limits, returning all evicted sample IDs.
@@ -398,12 +454,24 @@ impl InfluenceRegistry {
     pub fn can_unlearn(&self, sample_id: u64) -> bool {
         self.samples
             .get(&sample_id)
-            .map_or(false, |s| !s.tree_indices.is_empty())
+            .is_some_and(|s| !s.tree_indices.is_empty())
     }
 
     /// Get tree indices for a sample.
     pub fn get_tree_indices(&self, sample_id: u64) -> Option<&Vec<usize>> {
         self.samples.get(&sample_id).map(|s| &s.tree_indices)
+    }
+
+    /// All sample ids currently in the buffer (Q2-2 rebuild: snapshot of the window).
+    pub fn current_ids(&self) -> Vec<u64> {
+        self.samples.keys().copied().collect()
+    }
+
+    /// Overwrite tree indices for a sample (Q2-2 rebuild: reassign after forest rebuild).
+    pub fn set_tree_indices(&mut self, sample_id: u64, tree_indices: Vec<usize>) {
+        if let Some(sample) = self.samples.get_mut(&sample_id) {
+            sample.tree_indices = tree_indices;
+        }
     }
 
     /// Get label for a sample.
@@ -424,7 +492,18 @@ impl InfluenceRegistry {
 
     /// Get cached influence score for a sample.
     pub fn get_influence(&self, sample_id: u64) -> Option<f64> {
-        self.samples.get(&sample_id).and_then(|s| s.cached_influence)
+        self.samples
+            .get(&sample_id)
+            .and_then(|s| s.cached_influence)
+    }
+
+    /// Snapshot of (sample_id, cached_influence) for all samples that have a
+    /// cached influence score. Read-only; used by detection-recall analysis.
+    pub fn cached_influences(&self) -> Vec<(u64, f64)> {
+        self.samples
+            .iter()
+            .filter_map(|(&id, s)| s.cached_influence.map(|inf| (id, inf)))
+            .collect()
     }
 
     /// Clear all cached influence scores.
@@ -469,12 +548,17 @@ impl InfluenceRegistry {
     }
 
     /// Get samples with consistently positive influence (core concept samples).
-    pub fn get_core_concept_samples(&self, min_observations: usize, min_avg_influence: f64) -> Vec<u64> {
+    pub fn get_core_concept_samples(
+        &self,
+        min_observations: usize,
+        min_avg_influence: f64,
+    ) -> Vec<u64> {
         self.samples
             .iter()
             .filter(|(_, s)| {
                 s.influence_history.len() >= min_observations
-                    && s.average_influence().map_or(false, |avg| avg >= min_avg_influence)
+                    && s.average_influence()
+                        .is_some_and(|avg| avg >= min_avg_influence)
             })
             .map(|(&id, _)| id)
             .collect()
@@ -524,108 +608,33 @@ impl InfluenceRegistry {
     }
 
     /// Get samples by influence stability (low variance = stable).
-    pub fn get_stable_influence_samples(&self, max_variance: f64, min_observations: usize) -> Vec<u64> {
+    pub fn get_stable_influence_samples(
+        &self,
+        max_variance: f64,
+        min_observations: usize,
+    ) -> Vec<u64> {
         self.samples
             .iter()
             .filter(|(_, s)| s.influence_history.len() >= min_observations)
             .filter(|(_, s)| {
                 let avg = s.average_influence().unwrap_or(0.0);
-                let variance: f64 = s.influence_history
+                let variance: f64 = s
+                    .influence_history
                     .iter()
                     .map(|(_, inf)| (inf - avg).powi(2))
-                    .sum::<f64>() / s.influence_history.len() as f64;
+                    .sum::<f64>()
+                    / s.influence_history.len() as f64;
                 variance <= max_variance
             })
             .map(|(&id, _)| id)
             .collect()
     }
 
-    /// Compute centroid of a class (average features - requires external feature store).
-    /// Returns sample IDs sorted by distance to centroid.
-    pub fn get_samples_by_centroid_distance(
-        &self,
-        label: bool,
-        features: &HashMap<u64, Vec<f32>>,
-    ) -> Vec<(u64, f64)> {
-        // Get samples of this class
-        let class_samples: Vec<u64> = self.get_samples_by_class(label);
-
-        if class_samples.is_empty() {
-            return Vec::new();
-        }
-
-        // Compute centroid (only from samples that have features)
-        let mut centroid: Option<Vec<f64>> = None;
-        let mut cnt: usize = 0;
-
-        for &id in &class_samples {
-            if let Some(feat) = features.get(&id) {
-                cnt += 1;
-                if centroid.is_none() {
-                    centroid = Some(feat.iter().map(|&f| f as f64).collect());
-                } else {
-                    let c = centroid.as_mut().unwrap();
-                    for (i, &f) in feat.iter().enumerate() {
-                        if i < c.len() {
-                            c[i] += f as f64;
-                        }
-                    }
-                }
-            }
-        }
-
-        let centroid = match centroid {
-            Some(mut c) => {
-                for v in c.iter_mut() {
-                    *v /= cnt as f64;
-                }
-                c
-            }
-            None => return Vec::new(),
-        };
-
-        // Compute distances
-        let mut distances: Vec<(u64, f64)> = class_samples
-            .iter()
-            .filter_map(|&id| {
-                features.get(&id).map(|feat| {
-                    let dist: f64 = feat
-                        .iter()
-                        .zip(centroid.iter())
-                        .map(|(&f, &c)| (f as f64 - c).powi(2))
-                        .sum::<f64>()
-                        .sqrt();
-                    (id, dist)
-                })
-            })
-            .collect();
-
-        distances.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        distances
-    }
-
-    /// Get boundary samples (samples with low prediction confidence, near decision boundary).
-    /// prediction_confidence: map of sample_id -> confidence score (0.5 = most uncertain)
-    pub fn get_boundary_samples(&self, prediction_confidence: &HashMap<u64, f64>, threshold: f64) -> Vec<(u64, f64)> {
-        let mut samples: Vec<(u64, f64)> = self
-            .samples
-            .keys()
-            .filter_map(|&id| {
-                prediction_confidence.get(&id).map(|&conf| {
-                    // Distance from 0.5 (most uncertain point)
-                    let uncertainty = 1.0 - (conf - 0.5).abs() * 2.0;
-                    (id, uncertainty)
-                })
-            })
-            .filter(|(_, uncertainty)| *uncertainty >= threshold)
-            .collect();
-
-        samples.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        samples
-    }
+    //   (호출 0건). feature-distance influence는 controller.update_feature_distance_scores에서
+    //   별도 구현.
 
     // =========================================================================
-    // Time Decay Selection Methods (NEW for Gradual Drift Adaptation)
+    // Time Decay Selection Methods (Gradual Drift Adaptation)
     // =========================================================================
 
     /// Get time-weighted harmful samples for gradual drift adaptation.
@@ -648,11 +657,7 @@ impl InfluenceRegistry {
     ///
     /// # Returns
     /// Vector of sample IDs sorted by weighted score (most removable first)
-    pub fn get_time_weighted_harmful_samples(
-        &self,
-        n: usize,
-        decay_rate: f64,
-    ) -> Vec<u64> {
+    pub fn get_time_weighted_harmful_samples(&self, n: usize, decay_rate: f64) -> Vec<u64> {
         let current_pos = self.current_position;
 
         let mut weighted: Vec<(u64, f64)> = self
@@ -682,9 +687,7 @@ impl InfluenceRegistry {
             .collect();
 
         // Sort by weighted score ascending (most negative = highest removal priority)
-        weighted.sort_by(|(_, a), (_, b)|
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        );
+        weighted.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         weighted.into_iter().take(n).map(|(id, _)| id).collect()
     }
@@ -714,9 +717,7 @@ impl InfluenceRegistry {
             })
             .collect();
 
-        weighted.sort_by(|(_, a), (_, b)|
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        );
+        weighted.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         weighted.into_iter().take(n).map(|(id, _)| id).collect()
     }
@@ -730,11 +731,7 @@ impl InfluenceRegistry {
     /// # Arguments
     /// * `n` - Number of samples to select
     /// * `age_bracket_size` - Samples within this many positions are considered same age
-    pub fn get_age_prioritized_samples(
-        &self,
-        n: usize,
-        age_bracket_size: u64,
-    ) -> Vec<u64> {
+    pub fn get_age_prioritized_samples(&self, n: usize, age_bracket_size: u64) -> Vec<u64> {
         let current_pos = self.current_position;
 
         let mut samples: Vec<(u64, u64, f64)> = self
@@ -750,14 +747,14 @@ impl InfluenceRegistry {
             .collect();
 
         // Sort by age bracket (descending = oldest first), then by influence (ascending = most harmful)
-        samples.sort_by(|(_, age_a, inf_a), (_, age_b, inf_b)| {
-            match age_b.cmp(age_a) {
-                std::cmp::Ordering::Equal => {
-                    inf_a.partial_cmp(inf_b).unwrap_or(std::cmp::Ordering::Equal)
-                }
+        samples.sort_by(
+            |(_, age_a, inf_a), (_, age_b, inf_b)| match age_b.cmp(age_a) {
+                std::cmp::Ordering::Equal => inf_a
+                    .partial_cmp(inf_b)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 other => other,
-            }
-        });
+            },
+        );
 
         samples.into_iter().take(n).map(|(id, _, _)| id).collect()
     }
@@ -768,11 +765,7 @@ impl InfluenceRegistry {
 
     /// Get oldest samples (by position).
     pub fn get_oldest_samples(&self, n: usize) -> Vec<u64> {
-        self.position_index
-            .values()
-            .take(n)
-            .copied()
-            .collect()
+        self.position_index.values().take(n).copied().collect()
     }
 
     /// Get newest samples (by position).
@@ -910,8 +903,7 @@ impl InfluenceRegistry {
             return Vec::new();
         }
 
-        let n_to_evict = (self.samples.len() - config.max_samples)
-            .max(config.eviction_batch_size);
+        let n_to_evict = (self.samples.len() - config.max_samples).max(config.eviction_batch_size);
 
         let evict_ids = self.compute_eviction_candidates(n_to_evict, &config);
 
@@ -968,69 +960,162 @@ impl InfluenceRegistry {
             return Vec::new();
         }
 
+        // Reservoir baseline: evict uniformly at random (ignore age/influence/class).
+        // Deterministic pseudo-random via hash(sample_id, current_pos) — reproducible
+        // without RNG state. Isolates drift-aware selection's contribution vs random.
+        if config.random_eviction {
+            let mut hashed: Vec<(u64, u64)> = self
+                .samples
+                .keys()
+                .map(|&id| {
+                    // splitmix64-style mix of id and stream position for uniform spread
+                    let mut z = id
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(current_pos.wrapping_mul(0xD1B54A32D192ED03));
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                    (id, z ^ (z >> 31))
+                })
+                .collect();
+            hashed.sort_by_key(|&(_, h)| h);
+            return hashed.into_iter().take(n).map(|(id, _)| id).collect();
+        }
+
         // Determine minority class for class-penalty scoring
         let minority_label = self.minority_class();
 
         // Compute max age for normalization
-        let max_age = self.position_index.keys().next()
+        let max_age = self
+            .position_index
+            .keys()
+            .next()
             .map(|&oldest_pos| current_pos.saturating_sub(oldest_pos) as f64)
             .unwrap_or(1.0)
             .max(1.0);
 
         // Compute influence range for dynamic normalization (handles both OOB influence
-        // in [-0.5, 0.5] and feature-distance in [-8.0, -0.1] without hard-coded clamp)
-        let (inf_min, inf_max) = self.samples.values()
+        // in [-0.5, 0.5] and feature-distance in [-8.0, -0.1] without hard-coded clamp).
+        //
+        // Bug-1 (determinism fix): empty filter_map yields sentinel (f64::MAX, f64::MIN).
+        // In that case (f64::MAX + f64::MIN) / 2.0 = 0.0, and (f64::MIN - 0.0) / 1e-9 = -inf,
+        // making all sample scores -inf and eviction selection depend on HashMap iter order
+        // (production non-determinism, hit when influence_update_interval > 0 in warmup
+        // and especially when influence_strategy="none" — all cached_influence stay None).
+        // Fix: detect sentinel and short-circuit influence component to 0.0 (neutral).
+        let (inf_min, inf_max) = self
+            .samples
+            .values()
             .filter_map(|s| s.cached_influence)
             .fold((f64::MAX, f64::MIN), |(mn, mx), v| (mn.min(v), mx.max(v)));
-        let inf_range = (inf_max - inf_min).max(1e-9);
+        let has_any_influence = inf_min != f64::MAX;
+        let inf_range = if has_any_influence {
+            (inf_max - inf_min).max(1e-9)
+        } else {
+            1.0
+        };
 
         let mut scored: Vec<(u64, f64)> = self
             .samples
             .iter()
-            .filter_map(|(&id, sample)| {
+            .map(|(&id, sample)| {
                 let age = current_pos.saturating_sub(sample.position) as f64;
 
                 let norm_age = age / max_age;
 
+                // Q2-1 ablation: replace the age signal with a deterministic uniform
+                // random value (splitmix64 of id + stream position), keeping class
+                // penalty and protection_factor identical to the composite path.
+                // Isolates whether age-based ordering adds anything beyond minority
+                // protection. When disabled, age_signal == norm_age (no behavior change).
+                let age_signal = if config.class_aware_random {
+                    let mut z = id
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(current_pos.wrapping_mul(0xD1B54A32D192ED03));
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                    let h = z ^ (z >> 31);
+                    (h >> 11) as f64 / (1u64 << 53) as f64 // uniform [0,1)
+                } else {
+                    norm_age
+                };
+
                 // Influence component: normalize to [0, 1] based on actual data range.
                 // Lower influence (more negative) → higher norm_influence → evict first.
-                // Samples without influence get midpoint → age determines their order.
-                let influence = sample.cached_influence.unwrap_or((inf_min + inf_max) / 2.0);
-                let norm_influence = (inf_max - influence) / inf_range;
+                // Bug-1 fix: if no sample has cached_influence yet, neutralize this term
+                // (norm_influence = 0.0) so age and class_penalty alone decide ordering.
+                // Without this guard, all samples got norm_influence = -inf → all scores
+                // collapsed to -inf → eviction picked arbitrarily via HashMap iter order.
+                let norm_influence = if has_any_influence {
+                    // Samples without cached value get midpoint (neutral within actual range).
+                    let influence = sample.cached_influence.unwrap_or((inf_min + inf_max) / 2.0);
+                    (inf_max - influence) / inf_range
+                } else {
+                    0.0
+                };
 
                 // Influence degradation bonus: samples that went from positive to negative
                 let degradation_bonus = if sample.is_influence_degraded() {
                     0.3 // Extra priority for degraded samples
                 } else if let Some(delta) = sample.influence_delta() {
-                    if delta < -0.1 { 0.15 } else { 0.0 } // Bonus for rapidly worsening
+                    if delta < -0.1 {
+                        0.15
+                    } else {
+                        0.0
+                    } // Bonus for rapidly worsening
                 } else {
                     0.0
                 };
 
                 // Class penalty: majority class gets slight penalty (easier to evict)
-                let class_penalty = if sample.label == minority_label { -0.5 } else { 0.0 };
+                let class_penalty = if sample.label == minority_label {
+                    -0.5
+                } else {
+                    0.0
+                };
 
-                let mut score = config.age_weight * norm_age
+                let mut score = config.age_weight * age_signal
                     + config.influence_weight * (norm_influence + degradation_bonus)
                     + config.class_weight * class_penalty;
 
-                // Soft minority protection: instead of binary skip, reduce eviction
-                // priority for under-represented classes. This prevents stale minority
-                // samples from accumulating indefinitely (which hurts in reversed-
-                // imbalance datasets like CIC-IDS2018 where attack is 97%) while
-                // still making them much harder to evict than majority samples.
-                let sample_class_ratio = self.class_counts[sample.label as usize] as f64
-                    / total.max(1) as f64;
-                if sample_class_ratio < config.minority_protection_ratio {
-                    score *= 0.1; // 10x harder to evict, but not impossible
-                }
+                // Adaptive minority protection: weaker protection that still allows
+                // the registry distribution to evolve with the data stream.
+                //
+                // Problem with strong protection (score *= 0.1):
+                //   Minority class becomes almost permanent in registry, preventing
+                //   the class distribution from tracking the actual data stream.
+                //   E.g., AnoShift registry stays at 88% attack forever even as
+                //   the actual stream changes from 89% to 27% attack.
+                //
+                // Solution: scale protection proportionally to imbalance severity.
+                //   - Extreme minority (<5%): strong protection (0.2x)
+                //   - Moderate minority (5-20%): mild protection (0.5x)
+                //   - Near-balanced (>20%): no special protection
+                // 곱셈 스택(×0.01=100x 보호) 대신 *더 강한 보호 factor 한 번만 적용*.
+                // 이전: extreme(×0.2) + PIHP(×0.05) = ×0.01 → minority core가 영구 잔존
+                let sample_class_ratio =
+                    self.class_counts[sample.label as usize] as f64 / total.max(1) as f64;
 
-                Some((id, score))
+                let mut protection_factor: f64 = 1.0;
+                if sample_class_ratio < 0.05 {
+                    protection_factor = protection_factor.min(0.2); // extreme minority
+                } else if sample_class_ratio < config.minority_protection_ratio {
+                    protection_factor = protection_factor.min(0.5); // moderate minority
+                }
+                score *= protection_factor;
+
+                (id, score)
             })
             .collect();
 
-        // Sort by score descending (highest = evict first)
-        scored.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by score descending (highest = evict first).
+        // Bug-1 fix: tie-break by sample id ascending — guarantees deterministic
+        // eviction order even when scores are equal (e.g., NaN/Inf, identical floats,
+        // or all-None influence after the has_any_influence guard above).
+        scored.sort_by(|(ia, a), (ib, b)| {
+            b.partial_cmp(a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| ia.cmp(ib))
+        });
 
         scored.into_iter().take(n).map(|(id, _)| id).collect()
     }
@@ -1163,7 +1248,11 @@ impl InfluenceRegistry {
 
     /// Get influence coverage: (samples with cached_influence != None, total samples).
     pub fn influence_coverage(&self) -> (usize, usize) {
-        let with_influence = self.samples.values().filter(|s| s.cached_influence.is_some()).count();
+        let with_influence = self
+            .samples
+            .values()
+            .filter(|s| s.cached_influence.is_some())
+            .count();
         (with_influence, self.samples.len())
     }
 
@@ -1173,18 +1262,19 @@ impl InfluenceRegistry {
     }
 
     /// Get up to N sample IDs using deterministic uniform sampling (no RNG needed).
-    /// Uses step-based sampling across the position_index for even coverage.
+    /// Uses step-based sampling across the position_index (BTreeMap) for
+    /// deterministic ordering and even coverage.
     pub fn get_sample_ids_uniform(&self, n: usize) -> Vec<u64> {
-        let total = self.samples.len();
+        let total = self.position_index.len();
         if total == 0 {
             return Vec::new();
         }
         if n >= total {
-            return self.samples.keys().copied().collect();
+            return self.position_index.values().copied().collect();
         }
         let step = total / n;
-        self.samples
-            .keys()
+        self.position_index
+            .values()
             .step_by(step.max(1))
             .take(n)
             .copied()
@@ -1216,14 +1306,25 @@ impl InfluenceRegistry {
         result.insert("n_attack".to_string(), self.class_counts[1] as f64);
 
         // Influence coverage
-        let with_influence = self.samples.values()
-            .filter(|s| s.cached_influence.is_some()).count();
+        let with_influence = self
+            .samples
+            .values()
+            .filter(|s| s.cached_influence.is_some())
+            .count();
         result.insert("n_with_influence".to_string(), with_influence as f64);
-        result.insert("influence_coverage".to_string(),
-            if total > 0 { with_influence as f64 / total as f64 } else { 0.0 });
+        result.insert(
+            "influence_coverage".to_string(),
+            if total > 0 {
+                with_influence as f64 / total as f64
+            } else {
+                0.0
+            },
+        );
 
         // Collect (age, influence) pairs for samples with influence
-        let pairs: Vec<(f64, f64)> = self.samples.values()
+        let pairs: Vec<(f64, f64)> = self
+            .samples
+            .values()
             .filter_map(|s| {
                 let age = current_pos.saturating_sub(s.position) as f64;
                 s.cached_influence.map(|inf| (age, inf))
@@ -1246,8 +1347,11 @@ impl InfluenceRegistry {
 
         // Spearman rank correlation
         // 1. Rank ages
-        let mut age_indexed: Vec<(usize, f64)> = pairs.iter()
-            .enumerate().map(|(i, (a, _))| (i, *a)).collect();
+        let mut age_indexed: Vec<(usize, f64)> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (a, _))| (i, *a))
+            .collect();
         age_indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut age_ranks = vec![0.0f64; n];
         for (rank, &(idx, _)) in age_indexed.iter().enumerate() {
@@ -1255,8 +1359,11 @@ impl InfluenceRegistry {
         }
 
         // 2. Rank influences
-        let mut inf_indexed: Vec<(usize, f64)> = pairs.iter()
-            .enumerate().map(|(i, (_, inf))| (i, *inf)).collect();
+        let mut inf_indexed: Vec<(usize, f64)> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, inf))| (i, *inf))
+            .collect();
         inf_indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut inf_ranks = vec![0.0f64; n];
         for (rank, &(idx, _)) in inf_indexed.iter().enumerate() {
@@ -1385,9 +1492,9 @@ mod tests {
 
         // Set influence scores
         registry.set_influence(0, -0.5); // Harmful
-        registry.set_influence(1, 0.2);  // Helpful
+        registry.set_influence(1, 0.2); // Helpful
         registry.set_influence(2, -0.8); // Most harmful
-        registry.set_influence(3, 0.1);  // Slightly helpful
+        registry.set_influence(3, 0.1); // Slightly helpful
         registry.set_influence(4, -0.3); // Somewhat harmful
 
         let harmful = registry.get_most_harmful_samples(3);
@@ -1443,15 +1550,15 @@ mod tests {
         }
 
         // Set influence scores
-        registry.set_influence(0, -0.5);  // Very harmful
-        registry.set_influence(1, -0.3);  // Harmful
+        registry.set_influence(0, -0.5); // Very harmful
+        registry.set_influence(1, -0.3); // Harmful
         registry.set_influence(2, -0.15); // Harmful
         registry.set_influence(3, -0.08); // Slightly harmful (borderline)
-        registry.set_influence(4, 0.0);   // Neutral
-        registry.set_influence(5, 0.1);   // Helpful
+        registry.set_influence(4, 0.0); // Neutral
+        registry.set_influence(5, 0.1); // Helpful
         registry.set_influence(6, -0.12); // Harmful
         registry.set_influence(7, -0.05); // Slightly harmful (borderline)
-        registry.set_influence(8, 0.2);   // Helpful
+        registry.set_influence(8, 0.2); // Helpful
         registry.set_influence(9, -0.25); // Harmful
 
         // Get harmful samples with threshold -0.1 (only include if influence < -0.1)
@@ -1483,6 +1590,8 @@ mod tests {
             age_weight: 0.4,
             influence_weight: 0.4,
             class_weight: 0.2,
+            random_eviction: false,
+            class_aware_random: false,
         });
 
         // Add 15 samples (budget is 10)
@@ -1491,7 +1600,11 @@ mod tests {
         }
 
         // Budget should have kicked in
-        assert!(registry.len() <= 13, "Registry should not exceed budget + batch: got {}", registry.len());
+        assert!(
+            registry.len() <= 13,
+            "Registry should not exceed budget + batch: got {}",
+            registry.len()
+        );
     }
 
     #[test]
@@ -1504,6 +1617,8 @@ mod tests {
             age_weight: 0.5,
             influence_weight: 0.3,
             class_weight: 0.2,
+            random_eviction: false,
+            class_aware_random: false,
         });
 
         // Add 9 benign + 1 attack (attack is 10% = minority)
@@ -1513,7 +1628,10 @@ mod tests {
         registry.register(9, vec![0], true); // Attack (minority)
 
         // After eviction, attack sample should be protected
-        assert!(registry.get(9).is_some(), "Minority attack sample should be protected");
+        assert!(
+            registry.get(9).is_some(),
+            "Minority attack sample should be protected"
+        );
     }
 
     #[test]
@@ -1530,7 +1648,10 @@ mod tests {
         // Degrades to negative
         registry.set_influence(0, -0.3);
         let sample = registry.get(0).unwrap();
-        assert!(sample.is_influence_degraded(), "Should detect positive→negative transition");
+        assert!(
+            sample.is_influence_degraded(),
+            "Should detect positive→negative transition"
+        );
         assert!((sample.influence_delta().unwrap() - (-0.8)).abs() < 1e-10);
     }
 
@@ -1575,19 +1696,19 @@ mod tests {
         // - Sample 1: old, helpful (+0.3)
         // - Sample 8: recent, harmful (-0.5)
         // - Sample 9: recent, helpful (+0.4)
-        registry.set_influence(0, -0.8);  // Old, very harmful
-        registry.set_influence(1, 0.3);   // Old, helpful
-        registry.set_influence(2, -0.3);  // Medium-old, harmful
-        registry.set_influence(3, 0.1);   // Medium-old, helpful
-        registry.set_influence(4, -0.2);  // Medium, harmful
-        registry.set_influence(5, 0.05);  // Medium, slightly helpful
-        registry.set_influence(6, -0.1);  // Medium-recent, slightly harmful
-        registry.set_influence(7, 0.2);   // Medium-recent, helpful
-        registry.set_influence(8, -0.5);  // Recent, harmful
-        registry.set_influence(9, 0.4);   // Recent, helpful
+        registry.set_influence(0, -0.8); // Old, very harmful
+        registry.set_influence(1, 0.3); // Old, helpful
+        registry.set_influence(2, -0.3); // Medium-old, harmful
+        registry.set_influence(3, 0.1); // Medium-old, helpful
+        registry.set_influence(4, -0.2); // Medium, harmful
+        registry.set_influence(5, 0.05); // Medium, slightly helpful
+        registry.set_influence(6, -0.1); // Medium-recent, slightly harmful
+        registry.set_influence(7, 0.2); // Medium-recent, helpful
+        registry.set_influence(8, -0.5); // Recent, harmful
+        registry.set_influence(9, 0.4); // Recent, helpful
 
         // Test time-weighted selection with medium decay
-        let decay_rate = 0.1;  // Fast decay for testing
+        let decay_rate = 0.1; // Fast decay for testing
         let selected = registry.get_time_weighted_harmful_samples(3, decay_rate);
 
         // With time decay, old harmful samples should be prioritized
@@ -1597,7 +1718,11 @@ mod tests {
         // All selected should have negative influence
         for &id in &selected {
             let inf = registry.get_influence(id).unwrap();
-            assert!(inf < 0.0, "Selected sample {} should have negative influence", id);
+            assert!(
+                inf < 0.0,
+                "Selected sample {} should have negative influence",
+                id
+            );
         }
     }
 
@@ -1659,7 +1784,10 @@ mod tests {
 
         // Oldest samples (0-4) should be selected first
         // Within those, harmful ones (influence -0.5) should come first
-        assert!(selected.iter().all(|&id| id < 10), "Should prioritize older samples");
+        assert!(
+            selected.iter().all(|&id| id < 10),
+            "Should prioritize older samples"
+        );
     }
 
     // =========================================================================
@@ -1687,23 +1815,27 @@ mod tests {
             age_weight: 0.4,
             influence_weight: 0.4,
             class_weight: 0.2,
+            random_eviction: false,
+            class_aware_random: false,
         });
 
         // Trigger budget enforcement via register_batch
-        let _evicted = registry.register_batch(
-            &[100, 101],
-            &[vec![0], vec![0]],
-            &[false, false],
-        );
+        let _evicted = registry.register_batch(&[100, 101], &[vec![0], vec![0]], &[false, false]);
 
         // After eviction, minority (attack) should still be present
         let minority_remaining = (8..12).filter(|&id| registry.get(id).is_some()).count();
         let majority_remaining = (0..8).filter(|&id| registry.get(id).is_some()).count();
 
-        assert!(minority_remaining >= 3,
-            "Minority should be protected: {} remaining out of 4", minority_remaining);
-        assert!(majority_remaining < 8,
-            "Majority should bear most eviction: {} remaining out of 8", majority_remaining);
+        assert!(
+            minority_remaining >= 3,
+            "Minority should be protected: {} remaining out of 4",
+            minority_remaining
+        );
+        assert!(
+            majority_remaining < 8,
+            "Majority should bear most eviction: {} remaining out of 8",
+            majority_remaining
+        );
     }
 
     #[test]
@@ -1716,6 +1848,8 @@ mod tests {
             age_weight: 1.0,
             influence_weight: 0.0,
             class_weight: 0.0,
+            random_eviction: false,
+            class_aware_random: false,
         });
 
         // Fill to budget
@@ -1735,9 +1869,17 @@ mod tests {
         assert!(!evicted.is_empty(), "Should return evicted IDs");
         // Evicted IDs should no longer be in registry
         for &id in &evicted {
-            assert!(registry.get(id).is_none(), "Evicted sample {} should not be in registry", id);
+            assert!(
+                registry.get(id).is_none(),
+                "Evicted sample {} should not be in registry",
+                id
+            );
         }
         // Registry should be at or near budget
-        assert!(registry.len() <= 8, "Registry {} should be near budget 5", registry.len());
+        assert!(
+            registry.len() <= 8,
+            "Registry {} should be near budget 5",
+            registry.len()
+        );
     }
 }
